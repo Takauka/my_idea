@@ -26,7 +26,7 @@ class EnvironmentalAttentionModule(nn.Module):
         
         # 軌跡エンコーダ（改善版）
         self.traj_encoder = nn.Sequential(
-            nn.Linear(2, embedding_dim),
+            nn.Linear(embedding_dim, embedding_dim),
             nn.LayerNorm(embedding_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
