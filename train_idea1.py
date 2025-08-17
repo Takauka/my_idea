@@ -1,8 +1,3 @@
-"""
-エラー修正版 train_idea1.py - 3次元データ対応版
-モデルとデータの次元を3次元に統一し、損失計算を修正した完全動作バージョン
-"""
-
 import torch
 import torch.nn as nn
 import numpy as np
@@ -17,8 +12,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ### 修正点 ###
-# 3次元のダミーデータを生成するように変更
 def create_dummy_data(batch_size=4, seq_len=8, pred_len=12, num_pedestrians=5, feature_dim=3):
     """3次元のダミーデータを作成"""
     logger.info(f"🎭 {feature_dim}次元のダミーデータを作成中...")
@@ -30,11 +23,9 @@ def create_dummy_data(batch_size=4, seq_len=8, pred_len=12, num_pedestrians=5, f
     logger.info(f"✅ ダミーデータ作成完了:")
     logger.info(f"   入力軌跡: {input_trajectories.shape}")
     logger.info(f"   ターゲット軌跡: {target_trajectories.shape}")
-    logger.info(f"   障害物マップ: {obstacle_maps.shape}")
     
     return input_trajectories, target_trajectories, obstacle_maps
 
-# (check_dataloader_availability, process_dataloader_batch は変更なし)
 def check_dataloader_availability():
     """DataLoaderが使用可能かチェック"""
     try:
@@ -42,24 +33,35 @@ def check_dataloader_availability():
         from utils import DataLoader
         data_dirs = ['data/train', 'data/test', 'data/validation']
         if not any(os.path.exists(d) and os.listdir(d) for d in data_dirs): return False
-        dataloader = DataLoader(f_prefix='.', batch_size=2, seq_length=8, forcePreProcess=False, infer=False)
+        # DataLoaderの初期化をテスト
+        loader = DataLoader(f_prefix='.', batch_size=2, seq_length=8, pred_length=12)
         return True
     except Exception:
         return False
 
-def process_dataloader_batch(dataloader):
-    """DataLoaderからバッチを安全に取得"""
+def process_dataloader_batch(dataloader, pred_len):
+    """DataLoaderからバッチを安全に取得し、形状を検証"""
     try:
         x_batch, y_batch, _, _, _, _ = dataloader.next_batch()
-        if not x_batch or not y_batch: return None
         
-        input_data = torch.from_numpy(np.array(x_batch)).float()
-        target_data = torch.from_numpy(np.array(y_batch)).float()
+        if not isinstance(x_batch, (list, np.ndarray)) or not isinstance(y_batch, (list, np.ndarray)):
+             return None
+        if len(x_batch) == 0 or len(y_batch) == 0:
+            return None
 
-        # データ形状を (batch, seq_len, num_peds, features) に整形
-        input_trajectories = input_data.permute(1, 0, 2, 3)
-        target_trajectories = target_data.permute(1, 0, 2, 3)
+        # (seq_len, batch, num_peds, features) -> (batch, seq_len, num_peds, features)
+        input_trajectories = torch.from_numpy(np.array(x_batch)).float().permute(1, 0, 2, 3)
+        target_trajectories = torch.from_numpy(np.array(y_batch)).float().permute(1, 0, 2, 3)
         
+        # ### ★★★★★ エラー原因の核心 ★★★★★ ###
+        # DataLoaderが返すターゲットのシーケンス長を検証
+        if target_trajectories.shape[1] != pred_len:
+            logger.warning(
+                f"⚠️ DataLoaderが返すターゲット長({target_trajectories.shape[1]})が"
+                f"期待値({pred_len})と異なります。このバッチをスキップします。"
+            )
+            return None
+            
         obstacle_maps = torch.randn(input_trajectories.shape[0], 2)
         
         return {
@@ -78,18 +80,15 @@ def safe_train_step(model, optimizer, input_traj, target_traj, obstacle_map,
     optimizer.zero_grad()
     
     try:
-        # フォワードパス
         final_pred, stage1_pred, contrast_feature = model(
             input_traj, obstacle_map, training=True
         )
         
-        # ### 修正点 ###
         # 損失計算の前に、ターゲット軌跡もモデルへの入力と同じように
         # 最初の歩行者データのみをスライスする
         target_traj_for_loss = target_traj[:, :, 0, :]
         
         # 損失計算
-        # stage1_predのシーケンス長はターゲット全体と異なるため、合わせてスライス
         main_loss = nn.functional.mse_loss(final_pred, target_traj_for_loss)
         stage1_loss = nn.functional.mse_loss(stage1_pred, target_traj_for_loss[:, :stage1_pred.shape[1], :])
         
@@ -125,7 +124,7 @@ def create_zero_losses():
 
 def main():
     """メイン関数"""
-    logger.info("🚀 修正版 train_idea1.py 開始 (3D対応)")
+    logger.info("🚀 修正版 train_idea1.py 開始 (DataLoader設定修正)")
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info(f"使用デバイス: {device}")
@@ -142,7 +141,7 @@ def main():
     config = {
         'batch_size': 4, 'seq_len': 8, 'pred_len': 12, 'num_pedestrians': 5,
         'hidden_dim': 64, 'num_epochs': 20, 'learning_rate': 0.001,
-        'weight_decay': 1e-5, 'feature_dim': 3 # ### 修正点 ### 特徴量次元を3に設定
+        'weight_decay': 1e-5, 'feature_dim': 3
     }
     logger.info(f"設定: {config}")
     
@@ -151,7 +150,14 @@ def main():
     if use_dataloader:
         try:
             from utils import DataLoader
-            train_dataloader = DataLoader(f_prefix='.', batch_size=config['batch_size'], seq_length=config['seq_len'])
+            # ### ★★★★★ エラー原因の核心 ★★★★★ ###
+            # DataLoader初期化時に、予測長(pred_length)を正しく渡す
+            train_dataloader = DataLoader(
+                f_prefix='.', 
+                batch_size=config['batch_size'], 
+                seq_length=config['seq_len'],
+                pred_length=config['pred_len'] # この引数が重要！
+            )
             logger.info("✅ DataLoader を使用します")
         except Exception as e:
             logger.error(f"❌ DataLoader 作成失敗: {e}")
@@ -160,8 +166,6 @@ def main():
     if not use_dataloader:
         logger.info("📊 ダミーデータを使用します")
     
-    # ### 修正点 ###
-    # モデルのinput_dimとoutput_dimを3に変更
     model = TwoStageTrajectoryPredictor(
         input_dim=config['feature_dim'],
         hidden_dim=config['hidden_dim'],
@@ -183,13 +187,12 @@ def main():
         
         for batch_idx in range(max_batches):
             if use_dataloader:
-                batch_data = process_dataloader_batch(train_dataloader)
+                batch_data = process_dataloader_batch(train_dataloader, config['pred_len'])
                 if batch_data is None: continue
                 input_traj = batch_data['input_trajectories'].to(device)
                 target_traj = batch_data['target_trajectories'].to(device)
                 obstacle_map = batch_data['obstacle_map'].to(device)
             else:
-                # ダミーデータを使用
                 input_traj, target_traj, obstacle_map = create_dummy_data(
                     config['batch_size'], config['seq_len'], config['pred_len'],
                     config['num_pedestrians'], config['feature_dim']
