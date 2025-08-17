@@ -1,5 +1,7 @@
 """
 エラー修正版 train_idea1.py - DataLoader設定を修正した完全動作バージョン
+ETH/UCYデータセットで動作するように、DataLoaderの引数を修正し、
+データ形状の検証を追加しています。
 """
 
 import torch
@@ -30,7 +32,7 @@ def create_dummy_data(batch_size=4, seq_len=8, pred_len=12, num_pedestrians=5, f
     
     return input_trajectories, target_trajectories, obstacle_maps
 
-def check_dataloader_availability():
+def check_dataloader_availability(pred_len):
     """DataLoaderが使用可能かチェック"""
     try:
         if not os.path.exists('utils.py'): return False
@@ -38,7 +40,7 @@ def check_dataloader_availability():
         data_dirs = ['data/train', 'data/test', 'data/validation']
         if not any(os.path.exists(d) and os.listdir(d) for d in data_dirs): return False
         # DataLoaderの初期化をテスト
-        loader = DataLoader(f_prefix='.', batch_size=2, seq_length=8, pred_length=12)
+        loader = DataLoader(f_prefix='.', batch_size=2, seq_length=8, pred_len=pred_len)
         return True
     except Exception:
         return False
@@ -109,9 +111,10 @@ def safe_train_step(model, optimizer, input_traj, target_traj, obstacle_map,
         
         # ADE・FDE計算
         with torch.no_grad():
-            displacement_errors = torch.norm(final_pred - target_traj_for_loss, dim=-1)
+            # 座標(x,y)のみを使って誤差を計算 (次元が3以上の場合を想定)
+            displacement_errors = torch.norm(final_pred[..., :2] - target_traj_for_loss[..., :2], dim=-1)
             ade = displacement_errors.mean()
-            fde = torch.norm(final_pred[:, -1] - target_traj_for_loss[:, -1], dim=-1).mean()
+            fde = torch.norm(final_pred[:, -1, :2] - target_traj_for_loss[:, -1, :2], dim=-1).mean()
         
         return {
             'total_loss': total_loss.item(), 'ade': ade.item(), 'fde': fde.item()
@@ -143,24 +146,31 @@ def main():
         return
     
     config = {
-        'batch_size': 4, 'seq_len': 8, 'pred_len': 12, 'num_pedestrians': 5,
-        'hidden_dim': 64, 'num_epochs': 500, 'learning_rate': 0.001,
-        'weight_decay': 1e-5, 'feature_dim': 3
+        'batch_size': 4, 
+        'seq_len': 8, 
+        'pred_len': 12, 
+        'num_pedestrians': 5,
+        'hidden_dim': 64, 
+        'num_epochs': 500, 
+        'learning_rate': 0.001,
+        'weight_decay': 1e-5, 
+        'feature_dim': 3
     }
     logger.info(f"設定: {config}")
     
-    use_dataloader = check_dataloader_availability()
+    use_dataloader = check_dataloader_availability(config['pred_len'])
     train_dataloader = None
     if use_dataloader:
         try:
             from utils import DataLoader
             # ### ★★★★★ エラー原因の核心 ★★★★★ ###
-            # DataLoader初期化時に、予測長(pred_length)を正しく渡す
+            # DataLoader初期化時に、予測長(pred_len)を正しく渡す
+            # 注: utils.pyのDataLoaderが 'pred_len' という引数名を受け取ることを想定しています
             train_dataloader = DataLoader(
                 f_prefix='.', 
                 batch_size=config['batch_size'], 
                 seq_length=config['seq_len'],
-                pred_length=config['pred_len'] # この引数が重要！
+                pred_len=config['pred_len'] 
             )
             logger.info("✅ DataLoader を使用します")
         except Exception as e:
@@ -187,12 +197,17 @@ def main():
         logger.info(f"**************** Epoch {epoch+1}/{config['num_epochs']} ****************")
         
         epoch_losses, epoch_ades, epoch_fdes = [], [], []
-        max_batches = 20
+        max_batches_per_epoch = 50 # 1エポックあたりのバッチ数を増やす
         
-        for batch_idx in range(max_batches):
+        for batch_idx in range(max_batches_per_epoch):
             if use_dataloader:
                 batch_data = process_dataloader_batch(train_dataloader, config['pred_len'])
-                if batch_data is None: continue
+                if batch_data is None:
+                    if dataloader.num_batches == 0:
+                        logger.warning("DataLoaderにバッチがありません。訓練を終了します。")
+                        break
+                    dataloader.reset_batch_pointer() # バッチポインタをリセット
+                    continue
                 input_traj = batch_data['input_trajectories'].to(device)
                 target_traj = batch_data['target_trajectories'].to(device)
                 obstacle_map = batch_data['obstacle_map'].to(device)
@@ -209,12 +224,16 @@ def main():
             epoch_ades.append(losses['ade'])
             epoch_fdes.append(losses['fde'])
             
-            if (batch_idx + 1) % 5 == 0:
-                logger.info(f"   バッチ {batch_idx+1}/{max_batches}: Loss={losses['total_loss']:.4f}, ADE={losses['ade']:.4f}")
+            if (batch_idx + 1) % 10 == 0:
+                logger.info(f"   バッチ {batch_idx+1}/{max_batches_per_epoch}: Loss={losses['total_loss']:.4f}, ADE={losses['ade']:.4f}")
         
-        avg_loss = np.mean(epoch_losses) if epoch_losses else 0
-        avg_ade = np.mean(epoch_ades) if epoch_ades else 0
-        avg_fde = np.mean(epoch_fdes) if epoch_fdes else 0
+        if not epoch_losses: # エポック内で一度も学習が行われなかった場合
+            logger.warning(f"Epoch {epoch+1}では有効なバッチがありませんでした。")
+            continue
+
+        avg_loss = np.mean(epoch_losses)
+        avg_ade = np.mean(epoch_ades)
+        avg_fde = np.mean(epoch_fdes)
         
         logger.info(f"Epoch {epoch+1} 結果 - Loss: {avg_loss:.4f}, ADE: {avg_ade:.4f}, FDE: {avg_fde:.4f}")
 
