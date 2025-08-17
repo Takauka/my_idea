@@ -1,7 +1,5 @@
 """
-エラー修正版 train_idea1.py - DataLoader設定を修正した完全動作バージョン
-ETH/UCYデータセットで動作するように、DataLoaderの引数を修正し、
-データ形状の検証を追加しています。
+新しい二段階モデル(Social-STGCNN対応)用の訓練スクリプト
 """
 
 import torch
@@ -20,16 +18,9 @@ logger = logging.getLogger(__name__)
 
 def create_dummy_data(batch_size=4, seq_len=8, pred_len=12, num_pedestrians=5, feature_dim=3):
     """3次元のダミーデータを作成"""
-    logger.info(f"🎭 {feature_dim}次元のダミーデータを作成中...")
-    
     input_trajectories = torch.randn(batch_size, seq_len, num_pedestrians, feature_dim)
     target_trajectories = torch.randn(batch_size, pred_len, num_pedestrians, feature_dim)
     obstacle_maps = torch.randn(batch_size, 2)
-    
-    logger.info(f"✅ ダミーデータ作成完了:")
-    logger.info(f"   入力軌跡: {input_trajectories.shape}")
-    logger.info(f"   ターゲット軌跡: {target_trajectories.shape}")
-    
     return input_trajectories, target_trajectories, obstacle_maps
 
 def check_dataloader_availability(pred_len):
@@ -49,23 +40,14 @@ def process_dataloader_batch(dataloader, pred_len):
     """DataLoaderからバッチを安全に取得し、形状を検証"""
     try:
         x_batch, y_batch, _, _, _, _ = dataloader.next_batch()
-        
-        if not isinstance(x_batch, (list, np.ndarray)) or not isinstance(y_batch, (list, np.ndarray)):
-             return None
-        if len(x_batch) == 0 or len(y_batch) == 0:
-            return None
+        if not isinstance(x_batch, (list, np.ndarray)) or len(x_batch) == 0: return None
 
         # (seq_len, batch, num_peds, features) -> (batch, seq_len, num_peds, features)
         input_trajectories = torch.from_numpy(np.array(x_batch)).float().permute(1, 0, 2, 3)
         target_trajectories = torch.from_numpy(np.array(y_batch)).float().permute(1, 0, 2, 3)
         
-        # ### ★★★★★ エラー原因の核心 ★★★★★ ###
-        # DataLoaderが返すターゲットのシーケンス長を検証
         if target_trajectories.shape[1] != pred_len:
-            logger.warning(
-                f"⚠️ DataLoaderが返すターゲット長({target_trajectories.shape[1]})が"
-                f"期待値({pred_len})と異なります。このバッチをスキップします。"
-            )
+            logger.warning(f"DataLoaderが返すターゲット長({target_trajectories.shape[1]})が期待値({pred_len})と異なります。スキップします。")
             return None
             
         obstacle_maps = torch.randn(input_trajectories.shape[0], 2)
@@ -75,8 +57,7 @@ def process_dataloader_batch(dataloader, pred_len):
             'target_trajectories': target_trajectories,
             'obstacle_map': obstacle_maps
         }
-    except Exception as e:
-        logger.error(f"❌ DataLoader バッチ処理エラー: {e}")
+    except Exception:
         return None
 
 def safe_train_step(model, optimizer, input_traj, target_traj, obstacle_map, 
@@ -86,39 +67,32 @@ def safe_train_step(model, optimizer, input_traj, target_traj, obstacle_map,
     optimizer.zero_grad()
     
     try:
-        final_pred, stage1_pred, contrast_feature = model(
-            input_traj, obstacle_map, training=True
-        )
+        final_pred, stage1_pred, contrast_feature = model(input_traj, obstacle_map)
         
-        # 損失計算の前に、ターゲット軌跡もモデルへの入力と同じように
-        # 最初の歩行者データのみをスライスする
+        # ターゲット歩行者(index 0)の正解データをスライス
         target_traj_for_loss = target_traj[:, :, 0, :]
         
         # 損失計算
         main_loss = nn.functional.mse_loss(final_pred, target_traj_for_loss)
         stage1_loss = nn.functional.mse_loss(stage1_pred, target_traj_for_loss[:, :stage1_pred.shape[1], :])
         
-        # 総合損失
-        total_loss = main_loss + 0.3 * stage1_loss + 0.1 * contrast_feature.mean()
+        # 安定した学習のため、コントラスト項は含めない
+        total_loss = main_loss + 0.3 * stage1_loss
         
         if torch.isnan(total_loss):
-            logger.error("❌ 損失がNaNになりました。スキップします。")
             return create_zero_losses()
 
         total_loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_value)
         optimizer.step()
         
-        # ADE・FDE計算
         with torch.no_grad():
-            # 座標(x,y)のみを使って誤差を計算 (次元が3以上の場合を想定)
+            # 座標(x,y)のみを使って誤差を計算
             displacement_errors = torch.norm(final_pred[..., :2] - target_traj_for_loss[..., :2], dim=-1)
             ade = displacement_errors.mean()
             fde = torch.norm(final_pred[:, -1, :2] - target_traj_for_loss[:, -1, :2], dim=-1).mean()
         
-        return {
-            'total_loss': total_loss.item(), 'ade': ade.item(), 'fde': fde.item()
-        }
+        return {'total_loss': total_loss.item(), 'ade': ade.item(), 'fde': fde.item()}
     except Exception as e:
         logger.error(f"❌ 訓練ステップでエラー: {e}")
         import traceback
@@ -126,12 +100,11 @@ def safe_train_step(model, optimizer, input_traj, target_traj, obstacle_map,
         return create_zero_losses()
 
 def create_zero_losses():
-    """ゼロ損失辞書を作成"""
     return {'total_loss': 0.0, 'ade': 0.0, 'fde': 0.0}
 
 def main():
     """メイン関数"""
-    logger.info("🚀 修正版 train_idea1.py 開始 (DataLoader設定修正)")
+    logger.info("🚀 新モデル(Social-STGCNN対応)での訓練を開始します")
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info(f"使用デバイス: {device}")
@@ -163,9 +136,7 @@ def main():
     if use_dataloader:
         try:
             from utils import DataLoader
-            # ### ★★★★★ エラー原因の核心 ★★★★★ ###
             # DataLoader初期化時に、予測長(pred_len)を正しく渡す
-            # 注: utils.pyのDataLoaderが 'pred_len' という引数名を受け取ることを想定しています
             train_dataloader = DataLoader(
                 f_prefix='.', 
                 batch_size=config['batch_size'], 
@@ -197,16 +168,16 @@ def main():
         logger.info(f"**************** Epoch {epoch+1}/{config['num_epochs']} ****************")
         
         epoch_losses, epoch_ades, epoch_fdes = [], [], []
-        max_batches_per_epoch = 50 # 1エポックあたりのバッチ数を増やす
+        max_batches_per_epoch = 50
         
         for batch_idx in range(max_batches_per_epoch):
             if use_dataloader:
                 batch_data = process_dataloader_batch(train_dataloader, config['pred_len'])
                 if batch_data is None:
-                    if dataloader.num_batches == 0:
+                    if train_dataloader.num_batches == 0:
                         logger.warning("DataLoaderにバッチがありません。訓練を終了します。")
                         break
-                    dataloader.reset_batch_pointer() # バッチポインタをリセット
+                    train_dataloader.reset_batch_pointer()
                     continue
                 input_traj = batch_data['input_trajectories'].to(device)
                 target_traj = batch_data['target_trajectories'].to(device)
@@ -227,19 +198,16 @@ def main():
             if (batch_idx + 1) % 10 == 0:
                 logger.info(f"   バッチ {batch_idx+1}/{max_batches_per_epoch}: Loss={losses['total_loss']:.4f}, ADE={losses['ade']:.4f}")
         
-        if not epoch_losses: # エポック内で一度も学習が行われなかった場合
+        if not epoch_losses:
             logger.warning(f"Epoch {epoch+1}では有効なバッチがありませんでした。")
             continue
 
-        avg_loss = np.mean(epoch_losses)
-        avg_ade = np.mean(epoch_ades)
-        avg_fde = np.mean(epoch_fdes)
-        
+        avg_loss, avg_ade, avg_fde = np.mean(epoch_losses), np.mean(epoch_ades), np.mean(epoch_fdes)
         logger.info(f"Epoch {epoch+1} 結果 - Loss: {avg_loss:.4f}, ADE: {avg_ade:.4f}, FDE: {avg_fde:.4f}")
 
     logger.info("🎉 訓練完了")
-    torch.save(model.state_dict(), 'final_model_3d.pth')
-    logger.info("✅ モデル保存完了: final_model_3d.pth")
+    torch.save(model.state_dict(), 'final_model_social.pth')
+    logger.info("✅ モデル保存完了: final_model_social.pth")
 
 if __name__ == "__main__":
     main()
