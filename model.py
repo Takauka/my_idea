@@ -125,8 +125,6 @@ class SingularTrajectoryPredictor(nn.Module):
         self.ecam = EnvironmentalAttentionModule(hidden_dim, dropout=dropout)
         self._initialize_weights()
     
-    # ### 修正点 ###
-    # 重み初期化メソッドを、より安全で一般的な方法に変更
     def _initialize_weights(self):
         """モデルの重みを初期化する"""
         for module in self.modules():
@@ -159,20 +157,22 @@ class SingularTrajectoryPredictor(nn.Module):
         encoded_seq, (h_n, c_n) = self.encoder_lstm(input_traj)
         encoded_seq = self.encoder_projection(encoded_seq)
         
+        # ### ★★★★★ 修正点 ★★★★★ ###
+        # ECAM（アテンション）の計算結果を、後続のデコーダで正しく使用する
         attended_seq, contrast_feature = self.ecam(encoded_seq, obstacle_map)
         
-        # デコーダの初期状態を準備
-        h_n_forward = h_n[-2,:,:] # 最終層の前方向
-        h_n_backward = h_n[-1,:,:] # 最終層の後ろ方向
-        decoder_h = torch.cat([h_n_forward, h_n_backward], dim=1)
-        decoder_h = self.encoder_projection(decoder_h).unsqueeze(0).repeat(self.num_layers, 1, 1)
+        # デコーダの初期状態を、アテンション適用後の特徴量から生成する
+        # attended_seqの最後のタイムステップをコンテキストとして使用
+        decoder_h = attended_seq[:, -1, :].unsqueeze(0).repeat(self.num_layers, 1, 1)
 
+        # セル状態は、元のエンコーダの最終状態を再利用する
         c_n_forward = c_n[-2,:,:]
         c_n_backward = c_n[-1,:,:]
         decoder_c = torch.cat([c_n_forward, c_n_backward], dim=1)
         decoder_c = self.encoder_projection(decoder_c).unsqueeze(0).repeat(self.num_layers, 1, 1)
 
         decoder_hidden = (decoder_h, decoder_c)
+        # ### 修正ここまで ###
         
         predicted_traj = []
         decoder_input = input_traj[:, -1:, :]
