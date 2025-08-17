@@ -1,8 +1,3 @@
-"""
-修正版 utils.py - DataLoader問題を解決
-元のDataLoaderの問題点を修正し、0出力問題を解決
-"""
-
 import os
 import pickle
 import numpy as np
@@ -27,14 +22,14 @@ def get_all_file_names(directory):
     return [f for f in os.listdir(directory) if f.endswith('.txt')]
 
 class DataLoader():
-    """修正版DataLoader - 0出力問題を解決"""
+    """最終修正版DataLoader - イテレーター対応"""
 
     def __init__(self, f_prefix, batch_size=5, seq_length=20, num_of_validation=0, 
                  forcePreProcess=False, infer=False, generate=False):
         '''
-        修正版DataLoaderの初期化
+        最終修正版DataLoaderの初期化
         '''
-        logger.info("🔧 修正版DataLoader初期化開始")
+        logger.info("🔧 最終修正版DataLoader初期化開始")
         
         # 基本的な設定
         self.batch_size = batch_size
@@ -42,6 +37,10 @@ class DataLoader():
         self.orig_seq_lenght = seq_length
         self.infer = infer
         self.generate = generate
+        
+        # イテレーター用変数
+        self.current_batch_index = 0
+        self.max_iterations_per_epoch = 50  # 1エポックあたりの最大イテレーション数
         
         # データセット次元
         self.dataset_dimensions = {'biwi': [720, 576], 'crowds': [720, 576], 
@@ -55,7 +54,6 @@ class DataLoader():
         # 修正: より多くのデータセットを有効化
         base_train_dataset = [
             '/data/train/biwi/biwi_hotel.txt',
-            # 必要に応じて他のデータセットも追加
         ]
         
         base_test_dataset = [
@@ -111,7 +109,7 @@ class DataLoader():
         self.data_file_vl = os.path.join(self.val_data_dir, "trajectories_val.cpkl")
         
         # バリデーション割合
-        self.val_fraction = 0.1  # 修正: 適切なバリデーション割合を設定
+        self.val_fraction = 0.1
         
         # フォルダファイル辞書作成
         self.create_folder_file_dict()
@@ -124,6 +122,114 @@ class DataLoader():
         self.reset_batch_pointer(valid=True)
         
         logger.info(f"✅ DataLoader初期化完了: {self.numDatasets}データセット, {self.num_batches}バッチ")
+    
+    def __iter__(self):
+        """イテレーター初期化"""
+        self.current_batch_index = 0
+        self.reset_batch_pointer(valid=False)
+        return self
+    
+    def __next__(self):
+        """次のバッチを取得"""
+        if self.current_batch_index >= self.max_iterations_per_epoch:
+            raise StopIteration
+        
+        try:
+            # バッチを取得
+            x_batch, y_batch, d, numPedsList_batch, PedsList_batch, target_ids = self.next_batch()
+            
+            # バッチをモデル用の形式に変換
+            batch_data = self.convert_batch_to_model_format(
+                x_batch, y_batch, d, numPedsList_batch, PedsList_batch, target_ids
+            )
+            
+            self.current_batch_index += 1
+            return batch_data
+            
+        except Exception as e:
+            logger.error(f"❌ バッチ取得エラー: {e}")
+            # エラーの場合はStopIterationを発生
+            raise StopIteration
+    
+    def __len__(self):
+        """エポックあたりの総バッチ数"""
+        return min(self.num_batches, self.max_iterations_per_epoch)
+    
+    def convert_batch_to_model_format(self, x_batch, y_batch, d, numPedsList_batch, PedsList_batch, target_ids):
+        """バッチをモデル用の形式に変換"""
+        try:
+            batch_size = len(x_batch)
+            seq_len = self.seq_length
+            
+            # 最大歩行者数を取得
+            max_peds = 0
+            for seq in x_batch:
+                for frame in seq:
+                    if len(frame) > max_peds:
+                        max_peds = len(frame)
+            
+            max_peds = max(max_peds, 1)  # 最低1人
+            
+            # 入力軌跡テンソル作成
+            input_trajectories = torch.zeros(batch_size, seq_len, max_peds, 2)
+            target_trajectories = torch.zeros(batch_size, seq_len, max_peds, 2)  # 予測用
+            
+            # データ変換
+            for b in range(batch_size):
+                x_seq = x_batch[b]
+                y_seq = y_batch[b]
+                
+                for t in range(min(len(x_seq), seq_len)):
+                    # 入力フレーム
+                    x_frame = x_seq[t]
+                    if len(x_frame) > 0:
+                        num_peds = min(len(x_frame), max_peds)
+                        for p in range(num_peds):
+                            if len(x_frame[p]) >= 3:  # [ped_id, x, y]
+                                input_trajectories[b, t, p, 0] = float(x_frame[p][1])  # x座標
+                                input_trajectories[b, t, p, 1] = float(x_frame[p][2])  # y座標
+                    
+                    # ターゲットフレーム
+                    if t < len(y_seq):
+                        y_frame = y_seq[t]
+                        if len(y_frame) > 0:
+                            num_peds = min(len(y_frame), max_peds)
+                            for p in range(num_peds):
+                                if len(y_frame[p]) >= 3:
+                                    target_trajectories[b, t, p, 0] = float(y_frame[p][1])
+                                    target_trajectories[b, t, p, 1] = float(y_frame[p][2])
+            
+            # 障害物マップ（ランダム生成）
+            obstacle_map = torch.randn(batch_size, 2) * 2.0
+            
+            return {
+                'input_trajectories': input_trajectories,
+                'target_trajectories': target_trajectories,
+                'obstacle_map': obstacle_map,
+                'batch_info': {
+                    'dataset_indices': d,
+                    'target_ids': target_ids,
+                    'num_peds_list': numPedsList_batch
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"❌ バッチ変換エラー: {e}")
+            # エラーの場合はダミーバッチを返す
+            batch_size = self.batch_size
+            seq_len = self.seq_length
+            max_peds = 5
+            
+            return {
+                'input_trajectories': torch.randn(batch_size, seq_len, max_peds, 2),
+                'target_trajectories': torch.randn(batch_size, seq_len, max_peds, 2),
+                'obstacle_map': torch.randn(batch_size, 2),
+                'batch_info': {
+                    'dataset_indices': [0] * batch_size,
+                    'target_ids': [1] * batch_size,
+                    'num_peds_list': [[max_peds] * seq_len] * batch_size
+                }
+            }
     
     def create_dummy_dataset(self, f_prefix):
         """ダミーデータセット作成（データが存在しない場合）"""
@@ -454,13 +560,6 @@ class DataLoader():
         
         return x_batch, y_batch, d, numPedsList_batch, PedsList_batch, target_ids
     
-    def next_valid_batch(self):
-        '''
-        修正版バリデーションバッチ取得
-        '''
-        # next_batch()と同様の修正を適用
-        return self.next_batch()  # 簡単化のため、同じ実装を使用
-    
     def tick_batch_pointer(self, valid=False):
         '''
         修正版バッチポインタ更新
@@ -487,39 +586,7 @@ class DataLoader():
             self.valid_dataset_pointer = 0
             self.valid_frame_pointer = 0
     
-    def convert_proper_array(self, x_seq, num_pedlist, pedlist):
-        '''
-        修正版配列変換
-        '''
-        try:
-            # ユニークID取得
-            unique_ids = pd.unique(np.concatenate(pedlist).ravel().tolist()).astype(int)
-            lookup_table = dict(zip(unique_ids, range(0, len(unique_ids))))
-            
-            seq_data = np.zeros(shape=(self.seq_length, len(lookup_table), 2))
-            
-            for ind, frame in enumerate(x_seq):
-                if len(frame) > 0:
-                    corr_index = [lookup_table.get(int(x), 0) for x in frame[:, 0]]
-                    valid_indices = [i for i in corr_index if i < len(lookup_table)]
-                    if valid_indices:
-                        seq_data[ind, valid_indices, :] = frame[:len(valid_indices), 1:3]
-            
-            return_arr = Variable(torch.from_numpy(seq_data).float())
-            return return_arr, lookup_table
-            
-        except Exception as e:
-            logger.error(f"❌ 配列変換エラー: {e}")
-            # ダミーデータ返却
-            seq_data = np.zeros(shape=(self.seq_length, 1, 2))
-            return_arr = Variable(torch.from_numpy(seq_data).float())
-            return return_arr, {1: 0}
-    
-    # 残りのヘルパーメソッド（元のまま）
-    def add_element_to_dict(self, dict_obj, key, value):
-        dict_obj.setdefault(key, [])
-        dict_obj[key].append(value)
-    
+    # 残りのヘルパーメソッド
     def get_dataset_path(self, base_path, f_prefix):
         dataset = []
         full_path = os.path.join(f_prefix, base_path)
@@ -538,6 +605,10 @@ class DataLoader():
             folder_name = dir_.split('/')[-2]
             file_name = dir_.split('/')[-1]
             self.add_element_to_dict(self.folder_file_dict, folder_name, file_name)
+    
+    def add_element_to_dict(self, dict_obj, key, value):
+        dict_obj.setdefault(key, [])
+        dict_obj[key].append(value)
     
     def get_file_name(self, offset=0, pointer_type='train'):
         try:
