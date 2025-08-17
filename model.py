@@ -194,30 +194,58 @@ class SingularTrajectoryPredictor(nn.Module):
                 training: bool = True) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
-            input_traj: (batch_size, seq_len, input_dim) - 通常は2次元座標
+            input_traj: 入力軌跡データ（形状は動的に処理）
             obstacle_map: (batch_size, 2)
             training: 訓練モードフラグ
         Returns:
             predicted_traj: (batch_size, pred_len, output_dim)
             contrast_feature: コントラスト学習用特徴量
         """
-        batch_size = input_traj.shape[0]
         
         # デバッグ情報
         print(f"SingularTrajectoryPredictor入力形状: {input_traj.shape}")
         print(f"期待される入力次元: {self.input_dim}")
         
-        # 入力次元チェック
-        if input_traj.shape[-1] != self.input_dim:
-            print(f"⚠️ 入力次元が期待値と異なります: {input_traj.shape[-1]} != {self.input_dim}")
-            # 必要に応じて次元調整
-            if input_traj.shape[-1] > self.input_dim:
-                input_traj = input_traj[..., :self.input_dim]  # 切り詰め
-            elif input_traj.shape[-1] < self.input_dim:
-                # パディング
-                padding_size = self.input_dim - input_traj.shape[-1]
+        # 入力テンソルの次元を正規化
+        original_shape = input_traj.shape
+        
+        # 4次元以上の場合は3次元に変換
+        if len(original_shape) > 3:
+            print(f"⚠️ 4次元以上のテンソルを3次元に変換: {original_shape}")
+            # 最初の3次元以外をflatenして結合
+            if len(original_shape) == 4:
+                batch_size, seq_len, num_peds, feature_dim = original_shape
+                # 複数歩行者の場合は平均化または最初の歩行者のみ使用
+                input_traj = input_traj[:, :, 0, :]  # 最初の歩行者のみ使用
+                print(f"   変換後形状: {input_traj.shape}")
+            else:
+                # さらに高次元の場合は reshape
+                input_traj = input_traj.view(original_shape[0], original_shape[1], -1)
+                print(f"   reshape後形状: {input_traj.shape}")
+        
+        batch_size = input_traj.shape[0]
+        
+        # 入力次元チェックと調整
+        current_input_dim = input_traj.shape[-1]
+        if current_input_dim != self.input_dim:
+            print(f"⚠️ 入力次元が期待値と異なります: {current_input_dim} != {self.input_dim}")
+            
+            if current_input_dim > self.input_dim:
+                # 次元が多い場合は切り詰め（最初のinput_dim次元のみ使用）
+                input_traj = input_traj[..., :self.input_dim]
+                print(f"   切り詰め後形状: {input_traj.shape}")
+            elif current_input_dim < self.input_dim:
+                # 次元が少ない場合はパディング
+                padding_size = self.input_dim - current_input_dim
                 padding = torch.zeros(*input_traj.shape[:-1], padding_size, device=input_traj.device)
                 input_traj = torch.cat([input_traj, padding], dim=-1)
+                print(f"   パディング後形状: {input_traj.shape}")
+        
+        # 最終的な形状チェック
+        if len(input_traj.shape) != 3:
+            raise ValueError(f"LSTM入力は3次元である必要があります。現在の形状: {input_traj.shape}")
+        
+        print(f"最終入力形状: {input_traj.shape}")
         
         # エンコーダで軌跡を符号化
         encoded_seq, (h_n, c_n) = self.encoder_lstm(input_traj)
@@ -332,7 +360,7 @@ class TwoStageTrajectoryPredictor(nn.Module):
         二段階予測を実行
         
         Args:
-            input_traj: (batch_size, seq_len, input_dim) - 入力軌跡
+            input_traj: 入力軌跡データ（形状は動的に処理）
             obstacle_map: (batch_size, 2) - 障害物マップ
             training: 訓練モードフラグ
             
@@ -340,9 +368,22 @@ class TwoStageTrajectoryPredictor(nn.Module):
             predicted_traj: (batch_size, pred_len, output_dim) - 予測軌跡
             contrast_feature: コントラスト学習用特徴量
         """
-        batch_size = input_traj.shape[0]
         
         print(f"TwoStageTrajectoryPredictor入力形状: {input_traj.shape}")
+        
+        # 入力の形状を正規化
+        original_shape = input_traj.shape
+        
+        # 4次元以上の場合は3次元に変換
+        if len(original_shape) > 3:
+            print(f"⚠️ 4次元以上のテンソルを3次元に変換: {original_shape}")
+            if len(original_shape) == 4:
+                batch_size, seq_len, num_peds, feature_dim = original_shape
+                # 複数歩行者がある場合は最初の歩行者のみ使用
+                input_traj = input_traj[:, :, 0, :]
+                print(f"   変換後形状: {input_traj.shape}")
+        
+        batch_size = input_traj.shape[0]
         print(f"短期予測長: {self.short_pred_len}, 長期予測長: {self.long_pred_len}")
         
         # Stage 1: 短期予測
@@ -382,7 +423,9 @@ class TwoStageTrajectoryPredictor(nn.Module):
         
         print(f"最終コントラスト特徴量形状: {final_contrast.shape}")
         
-        return refined_prediction, final_contrast
+        # train_idea1.pyとの互換性のため、3つの値を返す
+        # (final_pred, stage1_pred, contrast_loss)の形式で返す
+        return refined_prediction, short_pred, final_contrast
 
 
 # デバッグ用関数（以前のコードから）
@@ -416,21 +459,83 @@ def debug_tensor_flow():
     return encoded_seq
 
 
+# デバッグ用の入力テンソル処理関数
+def process_input_tensor(input_tensor: torch.Tensor, expected_dim: int = 2) -> torch.Tensor:
+    """
+    入力テンソルを正規化して3次元(batch_size, seq_len, feature_dim)に変換
+    
+    Args:
+        input_tensor: 入力テンソル
+        expected_dim: 期待される特徴量次元
+    
+    Returns:
+        正規化されたテンソル
+    """
+    print(f"🔧 入力テンソル処理開始")
+    print(f"   元の形状: {input_tensor.shape}")
+    
+    original_shape = input_tensor.shape
+    
+    # 2次元の場合 (batch_size, feature_dim) -> (batch_size, 1, feature_dim)
+    if len(original_shape) == 2:
+        input_tensor = input_tensor.unsqueeze(1)
+        print(f"   2次元→3次元: {input_tensor.shape}")
+    
+    # 4次元の場合 (batch_size, seq_len, num_agents, feature_dim)
+    elif len(original_shape) == 4:
+        batch_size, seq_len, num_agents, feature_dim = original_shape
+        # 最初のエージェントのみ使用
+        input_tensor = input_tensor[:, :, 0, :]
+        print(f"   4次元→3次元（最初のエージェント）: {input_tensor.shape}")
+    
+    # 5次元以上の場合
+    elif len(original_shape) > 4:
+        # 最初の2次元をbatch_size, seq_lenとして扱い、残りをflattenする
+        batch_size, seq_len = original_shape[:2]
+        feature_dim = np.prod(original_shape[2:])
+        input_tensor = input_tensor.view(batch_size, seq_len, feature_dim)
+        print(f"   高次元→3次元（flatten）: {input_tensor.shape}")
+    
+    # 特徴量次元の調整
+    current_feature_dim = input_tensor.shape[-1]
+    if current_feature_dim != expected_dim:
+        print(f"   特徴量次元調整: {current_feature_dim} → {expected_dim}")
+        
+        if current_feature_dim > expected_dim:
+            # 切り詰め
+            input_tensor = input_tensor[..., :expected_dim]
+        else:
+            # パディング
+            padding_size = expected_dim - current_feature_dim
+            padding = torch.zeros(*input_tensor.shape[:-1], padding_size, 
+                                device=input_tensor.device, dtype=input_tensor.dtype)
+            input_tensor = torch.cat([input_tensor, padding], dim=-1)
+    
+    print(f"   最終形状: {input_tensor.shape}")
+    return input_tensor
+
+
 # テスト用の簡単な関数
 def test_models():
     """モデルのテスト"""
     print("=== モデルテスト開始 ===")
     
-    # テストデータ
+    # テストデータ（異なる形状でテスト）
     batch_size = 4
     seq_len = 8
     input_dim = 2
     pred_len = 12
     
-    input_traj = torch.randn(batch_size, seq_len, input_dim)
-    obstacle_map = torch.randn(batch_size, 2)
+    # 3次元テンソルのテスト
+    input_traj_3d = torch.randn(batch_size, seq_len, input_dim)
+    print(f"3次元テスト入力形状: {input_traj_3d.shape}")
     
-    print(f"テスト入力形状: {input_traj.shape}")
+    # 4次元テンソルのテスト（複数歩行者）
+    num_pedestrians = 3
+    input_traj_4d = torch.randn(batch_size, seq_len, num_pedestrians, input_dim)
+    print(f"4次元テスト入力形状: {input_traj_4d.shape}")
+    
+    obstacle_map = torch.randn(batch_size, 2)
     
     # TwoStageTrajectoryPredictorのテスト
     try:
@@ -438,13 +543,28 @@ def test_models():
             input_dim=input_dim,
             seq_len=seq_len,
             pred_len=pred_len,
-            num_pedestrians=5  # パラメータを追加
+            num_pedestrians=num_pedestrians
         )
         
-        pred_traj, contrast_feat = model(input_traj, obstacle_map)
-        print(f"✅ TwoStageTrajectoryPredictor テスト成功")
-        print(f"   予測軌跡形状: {pred_traj.shape}")
-        print(f"   コントラスト特徴量形状: {contrast_feat.shape}")
+        # 3次元入力テスト
+        try:
+            result = model(input_traj_3d, obstacle_map)
+            print(f"✅ 3次元入力テスト成功")
+            print(f"   戻り値数: {len(result)}")
+            for i, tensor in enumerate(result):
+                print(f"   戻り値{i}形状: {tensor.shape}")
+        except Exception as e:
+            print(f"❌ 3次元入力テスト失敗: {e}")
+        
+        # 4次元入力テスト
+        try:
+            result = model(input_traj_4d, obstacle_map)
+            print(f"✅ 4次元入力テスト成功")
+            print(f"   戻り値数: {len(result)}")
+            for i, tensor in enumerate(result):
+                print(f"   戻り値{i}形状: {tensor.shape}")
+        except Exception as e:
+            print(f"❌ 4次元入力テスト失敗: {e}")
         
     except Exception as e:
         print(f"❌ TwoStageTrajectoryPredictor テスト失敗: {e}")
