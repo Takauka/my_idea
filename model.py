@@ -128,13 +128,15 @@ class SingularTrajectoryPredictor(nn.Module):
     """単体軌跡予測器（修正版）"""
     
     def __init__(self, input_dim: int = 2, hidden_dim: int = 64, output_dim: int = 2,
-                 seq_len: int = 8, pred_len: int = 12, num_layers: int = 2, dropout: float = 0.1):
+                 seq_len: int = 8, pred_len: int = 12, num_layers: int = 2, dropout: float = 0.1,
+                 num_pedestrians: int = 5):
         super(SingularTrajectoryPredictor, self).__init__()
         self.hidden_dim = hidden_dim
         self.seq_len = seq_len
         self.pred_len = pred_len
         self.num_layers = num_layers
         self.input_dim = input_dim  # 重要：input_dimを保存
+        self.num_pedestrians = num_pedestrians  # 歩行者数パラメータを追加
         
         # 改良されたLSTMエンコーダ（双方向 + 複数層）
         self.encoder_lstm = nn.LSTM(
@@ -259,7 +261,8 @@ class TwoStageTrajectoryPredictor(nn.Module):
     """二段階軌跡予測器 - 短期予測と長期予測を組み合わせたモデル"""
     
     def __init__(self, input_dim: int = 2, hidden_dim: int = 64, output_dim: int = 2,
-                 seq_len: int = 8, pred_len: int = 12, num_layers: int = 2, dropout: float = 0.1):
+                 seq_len: int = 8, pred_len: int = 12, num_layers: int = 2, dropout: float = 0.1,
+                 num_pedestrians: int = 5):
         super(TwoStageTrajectoryPredictor, self).__init__()
         
         self.input_dim = input_dim
@@ -267,6 +270,7 @@ class TwoStageTrajectoryPredictor(nn.Module):
         self.output_dim = output_dim
         self.seq_len = seq_len
         self.pred_len = pred_len
+        self.num_pedestrians = num_pedestrians  # 歩行者数パラメータを追加
         self.short_pred_len = pred_len // 2  # 短期予測長
         self.long_pred_len = pred_len - self.short_pred_len  # 長期予測長
         
@@ -278,7 +282,8 @@ class TwoStageTrajectoryPredictor(nn.Module):
             seq_len=seq_len,
             pred_len=self.short_pred_len,
             num_layers=num_layers,
-            dropout=dropout
+            dropout=dropout,
+            num_pedestrians=num_pedestrians  # パラメータを渡す
         )
         
         # Stage 2: 長期予測器（短期予測結果も入力として使用）
@@ -289,7 +294,8 @@ class TwoStageTrajectoryPredictor(nn.Module):
             seq_len=seq_len + self.short_pred_len,  # 元の軌跡 + 短期予測
             pred_len=self.long_pred_len,
             num_layers=num_layers,
-            dropout=dropout
+            dropout=dropout,
+            num_pedestrians=num_pedestrians  # パラメータを渡す
         )
         
         # 特徴量融合層
@@ -431,7 +437,8 @@ def test_models():
         model = TwoStageTrajectoryPredictor(
             input_dim=input_dim,
             seq_len=seq_len,
-            pred_len=pred_len
+            pred_len=pred_len,
+            num_pedestrians=5  # パラメータを追加
         )
         
         pred_traj, contrast_feat = model(input_traj, obstacle_map)
