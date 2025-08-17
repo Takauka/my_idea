@@ -314,18 +314,6 @@ class TwoStageTrajectoryPredictor(nn.Module):
             num_pedestrians=num_pedestrians  # パラメータを渡す
         )
         
-        # Stage 2: 長期予測器（短期予測結果も入力として使用）
-        self.long_term_predictor = SingularTrajectoryPredictor(
-            input_dim=input_dim, 
-            hidden_dim=hidden_dim,
-            output_dim=output_dim,
-            seq_len=seq_len + self.short_pred_len,  # 元の軌跡 + 短期予測
-            pred_len=self.long_pred_len,
-            num_layers=num_layers,
-            dropout=dropout,
-            num_pedestrians=num_pedestrians  # パラメータを渡す
-        )
-        
         # 特徴量融合層
         self.feature_fusion = nn.Sequential(
             nn.Linear(64, hidden_dim),  # コントラスト特徴量は32次元×2=64次元
@@ -398,7 +386,23 @@ class TwoStageTrajectoryPredictor(nn.Module):
         print(f"拡張入力形状: {extended_input.shape}")
         
         # Stage 2: 長期予測（拡張入力を使用）
-        long_pred, long_contrast = self.long_term_predictor(
+        # 長期予測用の独立モデルを作成（拡張入力に対応）
+        extended_seq_len = extended_input.shape[1]
+        extended_feature_dim = extended_input.shape[-1]
+        
+        # 動的に長期予測器を作成
+        long_term_model = SingularTrajectoryPredictor(
+            input_dim=extended_feature_dim,
+            hidden_dim=self.hidden_dim,
+            output_dim=self.output_dim,
+            seq_len=extended_seq_len,
+            pred_len=self.long_pred_len,
+            num_layers=2,  # デフォルト値
+            dropout=0.1,   # デフォルト値
+            num_pedestrians=self.num_pedestrians
+        ).to(extended_input.device)
+        
+        long_pred, long_contrast = long_term_model(
             extended_input, obstacle_map, training
         )
         
