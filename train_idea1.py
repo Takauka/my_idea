@@ -1,5 +1,6 @@
 """
-修正版 train_idea1.py - データローダー問題を解決
+最終修正版 train_idea1.py - イテレーター対応
+DataLoaderのイテレーター機能に対応し、0出力問題を完全解決
 """
 
 import torch
@@ -90,86 +91,111 @@ def debug_data_loader():
     
     return True
 
-class SimpleTrajectoryDataLoader:
-    """シンプルな軌跡データローダー（代替版）"""
+def safe_train_step(model, optimizer, input_traj, target_traj, obstacle_map, 
+                   grad_clip_value=1.0):
+    """安全な訓練ステップ"""
+    model.train()
+    optimizer.zero_grad()
     
-    def __init__(self, batch_size=2, seq_len=8, pred_len=12, num_pedestrians=5, 
-                 num_batches=50, device='cpu'):
-        self.batch_size = batch_size
-        self.seq_len = seq_len
-        self.pred_len = pred_len
-        self.num_pedestrians = num_pedestrians
-        self.num_batches = num_batches
-        self.device = device
-        self.current_batch = 0
-        
-        logger.info(f"シンプルデータローダー作成: batch_size={batch_size}")
-    
-    def __iter__(self):
-        self.current_batch = 0
-        return self
-    
-    def __next__(self):
-        if self.current_batch >= self.num_batches:
-            raise StopIteration
-        
-        # 現実的な軌跡データを生成
-        input_trajectories = torch.zeros(
-            self.batch_size, self.seq_len, self.num_pedestrians, 2, 
-            device=self.device
+    try:
+        # フォワードパス
+        final_pred, stage1_pred, contrast_loss = model(
+            input_traj, obstacle_map, training=True
         )
         
-        target_trajectories = torch.zeros(
-            self.batch_size, self.pred_len, self.num_pedestrians, 2, 
-            device=self.device
-        )
+        # 予測値の妥当性チェック
+        if torch.isnan(final_pred).any() or torch.isinf(final_pred).any():
+            logger.error("❌ 予測値にNaNまたは無限大が含まれています")
+            return {
+                'total_loss': 0.0,
+                'main_loss': 0.0,
+                'stage1_loss': 0.0,
+                'contrast_loss': 0.0,
+                'ade': 0.0,
+                'fde': 0.0,
+            }
         
-        # 各歩行者に異なる軌跡パターンを設定
-        for b in range(self.batch_size):
-            for p in range(self.num_pedestrians):
-                # ランダムな開始位置と速度
-                start_x = torch.randn(1) * 3 + p * 4
-                start_y = torch.randn(1) * 3 + b * 3
-                vel_x = torch.randn(1) * 0.2 + 1.0
-                vel_y = torch.randn(1) * 0.2 + 0.7
-                
-                # 観測軌跡
-                for t in range(self.seq_len):
-                    noise_x = torch.randn(1) * 0.1
-                    noise_y = torch.randn(1) * 0.1
-                    input_trajectories[b, t, p, 0] = start_x + vel_x * t + noise_x
-                    input_trajectories[b, t, p, 1] = start_y + vel_y * t + noise_y
-                
-                # 予測軌跡（観測の延長として）
-                last_pos = input_trajectories[b, -1, p]
-                velocity = input_trajectories[b, -1, p] - input_trajectories[b, -2, p]
-                
-                for t in range(self.pred_len):
-                    noise_x = torch.randn(1) * 0.05
-                    noise_y = torch.randn(1) * 0.05
-                    target_trajectories[b, t, p] = last_pos + velocity * (t + 1) + torch.tensor([noise_x, noise_y], device=self.device)
+        # 損失計算
+        main_loss = nn.functional.mse_loss(final_pred, target_traj)
+        stage1_loss = nn.functional.mse_loss(stage1_pred, target_traj)
         
-        # 障害物マップ
-        obstacle_map = torch.randn(self.batch_size, 2, device=self.device) * 3
+        # 損失の妥当性チェック
+        if torch.isnan(main_loss) or torch.isinf(main_loss):
+            logger.error("❌ 主損失にNaNまたは無限大が含まれています")
+            return {
+                'total_loss': 0.0,
+                'main_loss': 0.0,
+                'stage1_loss': 0.0,
+                'contrast_loss': 0.0,
+                'ade': 0.0,
+                'fde': 0.0,
+            }
         
-        self.current_batch += 1
+        # 総合損失
+        total_loss = main_loss + 0.3 * stage1_loss + 0.1 * contrast_loss
+        
+        # バックワードパス
+        total_loss.backward()
+        
+        # 勾配クリッピング
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_value)
+        
+        # 勾配チェック
+        total_grad_norm = 0.0
+        for param in model.parameters():
+            if param.grad is not None:
+                param_norm = param.grad.data.norm(2)
+                total_grad_norm += param_norm.item() ** 2
+        total_grad_norm = total_grad_norm ** (1. / 2)
+        
+        if total_grad_norm == 0.0:
+            logger.warning("⚠️ 勾配がゼロです")
+        
+        # オプティマイザーステップ
+        optimizer.step()
+        
+        # ADE・FDE計算
+        displacement_errors = torch.norm(final_pred - target_traj, dim=-1)
+        ade = displacement_errors.mean()
+        fde = torch.norm(final_pred[:, -1] - target_traj[:, -1], dim=-1).mean()
         
         return {
-            'input_trajectories': input_trajectories,
-            'target_trajectories': target_trajectories,
-            'obstacle_map': obstacle_map
+            'total_loss': total_loss.item(),
+            'main_loss': main_loss.item(),
+            'stage1_loss': stage1_loss.item(),
+            'contrast_loss': contrast_loss.item(),
+            'ade': ade.item(),
+            'fde': fde.item(),
+            'grad_norm': total_grad_norm
         }
-    
-    def __len__(self):
-        return self.num_batches
+        
+    except Exception as e:
+        logger.error(f"❌ 訓練ステップでエラー: {e}")
+        import traceback
+        traceback.print_exc()
+        return {
+            'total_loss': 0.0,
+            'main_loss': 0.0,
+            'stage1_loss': 0.0,
+            'contrast_loss': 0.0,
+            'ade': 0.0,
+            'fde': 0.0,
+            'grad_norm': 0.0
+        }
 
 def main():
     """メイン関数"""
-    logger.info("🚀 修正版 train_idea1.py 開始")
+    logger.info("🚀 最終修正版 train_idea1.py 開始")
     
     # 環境設定
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info(f"使用デバイス: {device}")
+    
+    # 再現性のための設定
+    torch.manual_seed(42)
+    np.random.seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(42)
     
     # モデルインポート
     try:
@@ -186,7 +212,7 @@ def main():
         'pred_len': 12,
         'num_pedestrians': 5,
         'hidden_dim': 64,
-        'num_epochs': 50,
+        'num_epochs': 20,
         'learning_rate': 0.0001,
         'weight_decay': 1e-5,
     }
@@ -197,33 +223,25 @@ def main():
     logger.info("📊 データローダー診断実行")
     original_loader_works = debug_data_loader()
     
-    if original_loader_works:
-        logger.info("✅ 元のDataLoaderを使用")
-        try:
-            from utils import DataLoader
-            train_dataloader = DataLoader(
-                f_prefix='.',
-                batch_size=config['batch_size'],
-                seq_length=config['seq_len'],
-                forcePreProcess=False,
-                infer=False
-            )
-            use_original_loader = True
-        except Exception as e:
-            logger.error(f"❌ 元のDataLoader作成失敗: {e}")
-            use_original_loader = False
-    else:
-        use_original_loader = False
+    if not original_loader_works:
+        logger.error("❌ DataLoaderが正常に動作しません")
+        return
     
-    if not use_original_loader:
-        logger.info("🔄 シンプルDataLoaderを使用")
-        train_dataloader = SimpleTrajectoryDataLoader(
+    # DataLoader作成
+    logger.info("✅ 修正版DataLoaderを使用")
+    try:
+        from utils import DataLoader
+        train_dataloader = DataLoader(
+            f_prefix='.',
             batch_size=config['batch_size'],
-            seq_len=config['seq_len'],
-            pred_len=config['pred_len'],
-            num_pedestrians=config['num_pedestrians'],
-            device=device
+            seq_length=config['seq_len'],
+            forcePreProcess=False,
+            infer=False
         )
+        logger.info("✅ DataLoader作成成功")
+    except Exception as e:
+        logger.error(f"❌ DataLoader作成失敗: {e}")
+        return
     
     # モデル作成
     logger.info("🏗️ モデル作成")
@@ -236,11 +254,10 @@ def main():
         num_pedestrians=config['num_pedestrians']
     ).to(device)
     
-    # トレーナー作成
-    trainer = TrajectoryPredictionTrainer(
-        model=model,
-        device=device,
-        learning_rate=config['learning_rate'],
+    # オプティマイザー作成
+    optimizer = torch.optim.AdamW(
+        model.parameters(), 
+        lr=config['learning_rate'], 
         weight_decay=config['weight_decay']
     )
     
@@ -256,93 +273,97 @@ def main():
         
         batch_count = 0
         
-        for batch_data in train_dataloader:
-            try:
-                if use_original_loader:
-                    # 元のDataLoaderの場合
-                    x_batch, y_batch, d, numPedsList_batch, PedsList_batch, target_ids = batch_data
+        try:
+            # イテレーターを使用してバッチを取得
+            for batch_data in train_dataloader:
+                try:
+                    # バッチデータ取得
+                    input_trajectories = batch_data['input_trajectories'].to(device)
+                    target_trajectories = batch_data['target_trajectories'].to(device)
+                    obstacle_map = batch_data['obstacle_map'].to(device)
                     
-                    # データ変換（複雑な処理が必要）
-                    # この部分は元のコードに依存するため、シンプル版を推奨
-                    logger.warning("元のDataLoader使用は複雑です。シンプル版を推奨。")
-                    break
-                    
-                else:
-                    # シンプルDataLoaderの場合
-                    input_trajectories = batch_data['input_trajectories']
-                    target_trajectories = batch_data['target_trajectories']
-                    obstacle_map = batch_data['obstacle_map']
-                
-                # 最初のバッチでデータ確認
-                if epoch == 0 and batch_count == 0:
-                    logger.info("📊 最初のバッチデータ確認")
-                    logger.info(f"  入力軌跡: shape={input_trajectories.shape}")
-                    logger.info(f"    平均={input_trajectories.mean():.6f}")
-                    logger.info(f"    標準偏差={input_trajectories.std():.6f}")
-                    logger.info(f"    最小={input_trajectories.min():.6f}")
-                    logger.info(f"    最大={input_trajectories.max():.6f}")
-                    logger.info(f"    ゼロ割合={(input_trajectories == 0).float().mean():.4f}")
-                    
-                    logger.info(f"  ターゲット軌跡: shape={target_trajectories.shape}")
-                    logger.info(f"    平均={target_trajectories.mean():.6f}")
-                    logger.info(f"    標準偏差={target_trajectories.std():.6f}")
-                    
-                    # データが全て0かチェック
-                    if (input_trajectories == 0).all():
-                        logger.error("❌ 入力データが全て0です！")
-                        return
-                    
-                    if (target_trajectories == 0).all():
-                        logger.error("❌ ターゲットデータが全て0です！")
-                        return
-                
-                # 訓練ステップ実行
-                losses = trainer.train_step(input_trajectories, target_trajectories, obstacle_map)
-                
-                # 損失記録
-                epoch_losses.append(losses['total_loss'])
-                epoch_ades.append(losses.get('ade', 0.0))
-                epoch_fdes.append(losses.get('fde', 0.0))
-                
-                # 最初のバッチで詳細確認
-                if epoch == 0 and batch_count == 0:
-                    logger.info("🔍 最初のバッチ損失詳細:")
-                    for key, value in losses.items():
-                        logger.info(f"  {key}: {value:.8f}")
-                    
-                    if losses['total_loss'] == 0.0:
-                        logger.error("❌ 損失が0です！これは異常です")
+                    # 最初のバッチでデータ確認
+                    if epoch == 0 and batch_count == 0:
+                        logger.info("📊 最初のバッチデータ確認")
+                        logger.info(f"  入力軌跡: shape={input_trajectories.shape}")
+                        logger.info(f"    平均={input_trajectories.mean():.6f}")
+                        logger.info(f"    標準偏差={input_trajectories.std():.6f}")
+                        logger.info(f"    最小={input_trajectories.min():.6f}")
+                        logger.info(f"    最大={input_trajectories.max():.6f}")
+                        logger.info(f"    ゼロ割合={(input_trajectories == 0).float().mean():.4f}")
                         
-                        # デバッグ用: モデル出力確認
-                        model.eval()
-                        with torch.no_grad():
-                            pred, _, _ = model(input_trajectories, obstacle_map, training=False)
-                            logger.info(f"  モデル出力統計:")
-                            logger.info(f"    平均={pred.mean():.8f}")
-                            logger.info(f"    標準偏差={pred.std():.8f}")
-                            logger.info(f"    最小={pred.min():.8f}")
-                            logger.info(f"    最大={pred.max():.8f}")
-                            
-                            # 予測とターゲットの差
-                            diff = (pred - target_trajectories).abs().mean()
-                            logger.info(f"    予測-ターゲット差平均={diff:.8f}")
-                        model.train()
+                        logger.info(f"  ターゲット軌跡: shape={target_trajectories.shape}")
+                        logger.info(f"    平均={target_trajectories.mean():.6f}")
+                        logger.info(f"    標準偏差={target_trajectories.std():.6f}")
                         
-                        if (pred == 0).all():
-                            logger.error("❌ モデル出力が全て0です！")
+                        # データが全て0かチェック
+                        if (input_trajectories == 0).all():
+                            logger.error("❌ 入力データが全て0です！")
                             return
-                
-                batch_count += 1
-                
-                # 10バッチ処理したら次のエポックへ
-                if batch_count >= 10:
-                    break
+                        
+                        if (target_trajectories == 0).all():
+                            logger.error("❌ ターゲットデータが全て0です！")
+                            return
                     
-            except Exception as e:
-                logger.error(f"❌ バッチ処理エラー: {e}")
-                import traceback
-                traceback.print_exc()
-                continue
+                    # 訓練ステップ実行
+                    losses = safe_train_step(model, optimizer, input_trajectories, target_trajectories, obstacle_map)
+                    
+                    # 損失記録
+                    epoch_losses.append(losses['total_loss'])
+                    epoch_ades.append(losses.get('ade', 0.0))
+                    epoch_fdes.append(losses.get('fde', 0.0))
+                    
+                    # 最初のバッチで詳細確認
+                    if epoch == 0 and batch_count == 0:
+                        logger.info("🔍 最初のバッチ損失詳細:")
+                        for key, value in losses.items():
+                            logger.info(f"  {key}: {value:.8f}")
+                        
+                        if losses['total_loss'] == 0.0:
+                            logger.error("❌ 損失が0です！これは異常です")
+                            
+                            # デバッグ用: モデル出力確認
+                            model.eval()
+                            with torch.no_grad():
+                                pred, _, _ = model(input_trajectories, obstacle_map, training=False)
+                                logger.info(f"  モデル出力統計:")
+                                logger.info(f"    平均={pred.mean():.8f}")
+                                logger.info(f"    標準偏差={pred.std():.8f}")
+                                logger.info(f"    最小={pred.min():.8f}")
+                                logger.info(f"    最大={pred.max():.8f}")
+                                
+                                # 予測とターゲットの差
+                                diff = (pred - target_trajectories).abs().mean()
+                                logger.info(f"    予測-ターゲット差平均={diff:.8f}")
+                            model.train()
+                            
+                            if (pred == 0).all():
+                                logger.error("❌ モデル出力が全て0です！")
+                                return
+                        else:
+                            logger.info("✅ 正常な損失が計算されました！")
+                    
+                    batch_count += 1
+                    
+                    # プログレス表示
+                    if batch_count % 5 == 0:
+                        logger.info(f"  バッチ {batch_count}: Loss={losses['total_loss']:.6f}, ADE={losses['ade']:.6f}")
+                    
+                    # 適度な数のバッチ処理後に次のエポックへ
+                    if batch_count >= 20:  # 1エポックあたり最大20バッチ
+                        break
+                        
+                except Exception as e:
+                    logger.error(f"❌ バッチ処理エラー: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    continue
+            
+        except Exception as e:
+            logger.error(f"❌ エポック処理エラー: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
         
         # エポック統計
         if epoch_losses:
@@ -361,8 +382,21 @@ def main():
             logger.info("✅ 正常な損失が計算されました！")
         else:
             logger.warning(f"⚠️ 損失が0です（エポック{epoch+1}）")
+        
+        # 学習率スケジューラー（オプション）
+        if epoch > 0 and epoch % 10 == 0:
+            for param_group in optimizer.param_groups:
+                param_group['lr'] *= 0.9
+                logger.info(f"学習率を調整: {param_group['lr']:.6f}")
     
     logger.info("🎉 訓練完了")
+    
+    # モデル保存
+    try:
+        torch.save(model.state_dict(), 'final_model.pth')
+        logger.info("✅ モデル保存完了: final_model.pth")
+    except Exception as e:
+        logger.error(f"❌ モデル保存エラー: {e}")
 
 if __name__ == "__main__":
     main()
