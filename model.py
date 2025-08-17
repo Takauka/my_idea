@@ -252,30 +252,134 @@ class SingularTrajectoryPredictor(nn.Module):
         
         return predicted_traj, contrast_feature
 
-# 簡単な修正版（一時的対処）
-def quick_fix_ecam():
-    """一時的な修正：ECAMの軌跡エンコーダーを座標入力用に変更"""
-    
-    # model.pyの該当行を以下に変更：
-    
-    # 修正前（84行目付近）:
-    # self.traj_encoder = nn.Sequential(
-    #     nn.Linear(embedding_dim, embedding_dim),  # これが問題
-    #     ...
-    # )
-    
-    # 修正後:
-    # self.traj_encoder = nn.Sequential(
-    #     nn.Linear(2, embedding_dim),  # 座標入力(2次元)を想定
-    #     nn.LayerNorm(embedding_dim),
-    #     nn.ReLU(),
-    #     nn.Dropout(dropout),
-    #     nn.Linear(embedding_dim, embedding_dim)
-    # )
-    
-    pass
 
-# デバッグ用関数
+# 新しく追加：TwoStageTrajectoryPredictor クラス
+
+class TwoStageTrajectoryPredictor(nn.Module):
+    """二段階軌跡予測器 - 短期予測と長期予測を組み合わせたモデル"""
+    
+    def __init__(self, input_dim: int = 2, hidden_dim: int = 64, output_dim: int = 2,
+                 seq_len: int = 8, pred_len: int = 12, num_layers: int = 2, dropout: float = 0.1):
+        super(TwoStageTrajectoryPredictor, self).__init__()
+        
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        self.seq_len = seq_len
+        self.pred_len = pred_len
+        self.short_pred_len = pred_len // 2  # 短期予測長
+        self.long_pred_len = pred_len - self.short_pred_len  # 長期予測長
+        
+        # Stage 1: 短期予測器
+        self.short_term_predictor = SingularTrajectoryPredictor(
+            input_dim=input_dim, 
+            hidden_dim=hidden_dim,
+            output_dim=output_dim,
+            seq_len=seq_len,
+            pred_len=self.short_pred_len,
+            num_layers=num_layers,
+            dropout=dropout
+        )
+        
+        # Stage 2: 長期予測器（短期予測結果も入力として使用）
+        self.long_term_predictor = SingularTrajectoryPredictor(
+            input_dim=input_dim, 
+            hidden_dim=hidden_dim,
+            output_dim=output_dim,
+            seq_len=seq_len + self.short_pred_len,  # 元の軌跡 + 短期予測
+            pred_len=self.long_pred_len,
+            num_layers=num_layers,
+            dropout=dropout
+        )
+        
+        # 特徴量融合層
+        self.feature_fusion = nn.Sequential(
+            nn.Linear(64, hidden_dim),  # コントラスト特徴量は32次元×2=64次元
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 32)  # 最終的なコントラスト特徴量
+        )
+        
+        # 予測軌跡の調整層（オプション）
+        self.trajectory_refinement = nn.Sequential(
+            nn.Linear(output_dim, hidden_dim // 4),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 4, output_dim)
+        )
+        
+        # 重み初期化
+        self._initialize_weights()
+    
+    def _initialize_weights(self):
+        """重み初期化メソッド"""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+    
+    def forward(self, input_traj: torch.Tensor, 
+                obstacle_map: Optional[torch.Tensor] = None,
+                training: bool = True) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        二段階予測を実行
+        
+        Args:
+            input_traj: (batch_size, seq_len, input_dim) - 入力軌跡
+            obstacle_map: (batch_size, 2) - 障害物マップ
+            training: 訓練モードフラグ
+            
+        Returns:
+            predicted_traj: (batch_size, pred_len, output_dim) - 予測軌跡
+            contrast_feature: コントラスト学習用特徴量
+        """
+        batch_size = input_traj.shape[0]
+        
+        print(f"TwoStageTrajectoryPredictor入力形状: {input_traj.shape}")
+        print(f"短期予測長: {self.short_pred_len}, 長期予測長: {self.long_pred_len}")
+        
+        # Stage 1: 短期予測
+        short_pred, short_contrast = self.short_term_predictor(
+            input_traj, obstacle_map, training
+        )
+        
+        print(f"短期予測結果形状: {short_pred.shape}")
+        
+        # Stage 1の予測結果を元の軌跡に結合して拡張入力を作成
+        extended_input = torch.cat([input_traj, short_pred], dim=1)
+        print(f"拡張入力形状: {extended_input.shape}")
+        
+        # Stage 2: 長期予測（拡張入力を使用）
+        long_pred, long_contrast = self.long_term_predictor(
+            extended_input, obstacle_map, training
+        )
+        
+        print(f"長期予測結果形状: {long_pred.shape}")
+        
+        # 短期と長期の予測を結合
+        full_prediction = torch.cat([short_pred, long_pred], dim=1)
+        print(f"最終予測形状: {full_prediction.shape}")
+        
+        # 予測軌跡の微調整（オプション）
+        refined_prediction = []
+        for t in range(full_prediction.shape[1]):
+            step_pred = full_prediction[:, t:t+1, :]
+            refined_step = step_pred + self.trajectory_refinement(step_pred)
+            refined_prediction.append(refined_step)
+        
+        refined_prediction = torch.cat(refined_prediction, dim=1)
+        
+        # コントラスト特徴量の融合
+        combined_contrast = torch.cat([short_contrast, long_contrast], dim=-1)
+        final_contrast = self.feature_fusion(combined_contrast)
+        
+        print(f"最終コントラスト特徴量形状: {final_contrast.shape}")
+        
+        return refined_prediction, final_contrast
+
+
+# デバッグ用関数（以前のコードから）
 def debug_tensor_flow():
     """テンソルの流れをデバッグ"""
     print("=== テンソル流れのデバッグ ===")
@@ -305,5 +409,44 @@ def debug_tensor_flow():
     
     return encoded_seq
 
+
+# テスト用の簡単な関数
+def test_models():
+    """モデルのテスト"""
+    print("=== モデルテスト開始 ===")
+    
+    # テストデータ
+    batch_size = 4
+    seq_len = 8
+    input_dim = 2
+    pred_len = 12
+    
+    input_traj = torch.randn(batch_size, seq_len, input_dim)
+    obstacle_map = torch.randn(batch_size, 2)
+    
+    print(f"テスト入力形状: {input_traj.shape}")
+    
+    # TwoStageTrajectoryPredictorのテスト
+    try:
+        model = TwoStageTrajectoryPredictor(
+            input_dim=input_dim,
+            seq_len=seq_len,
+            pred_len=pred_len
+        )
+        
+        pred_traj, contrast_feat = model(input_traj, obstacle_map)
+        print(f"✅ TwoStageTrajectoryPredictor テスト成功")
+        print(f"   予測軌跡形状: {pred_traj.shape}")
+        print(f"   コントラスト特徴量形状: {contrast_feat.shape}")
+        
+    except Exception as e:
+        print(f"❌ TwoStageTrajectoryPredictor テスト失敗: {e}")
+    
+    print("=== モデルテスト終了 ===")
+
+
 if __name__ == "__main__":
+    # デバッグとテストの実行
     debug_tensor_flow()
+    print("\n")
+    test_models()
