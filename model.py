@@ -92,8 +92,6 @@ class EnvironmentalAttentionModule(nn.Module):
 class SingularTrajectoryPredictor(nn.Module):
     """単体軌跡予測器（修正版）"""
     
-    # ### 修正点 ###
-    # ユーザーのデータ形式に合わせて、input_dimとoutput_dimのデフォルトを3に変更
     def __init__(self, input_dim: int = 3, hidden_dim: int = 64, output_dim: int = 3,
                  seq_len: int = 8, pred_len: int = 12, num_layers: int = 2, dropout: float = 0.1,
                  num_pedestrians: int = 5):
@@ -127,28 +125,31 @@ class SingularTrajectoryPredictor(nn.Module):
         self.ecam = EnvironmentalAttentionModule(hidden_dim, dropout=dropout)
         self._initialize_weights()
     
+    # ### 修正点 ###
+    # 重み初期化メソッドを、より安全で一般的な方法に変更
     def _initialize_weights(self):
-        for name, param in self.named_parameters():
-            if 'weight' in name:
-                if 'lstm' in name:
-                    if 'ih' in name:
+        """モデルの重みを初期化する"""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.LSTM):
+                for name, param in module.named_parameters():
+                    if 'weight_ih' in name:
                         nn.init.xavier_uniform_(param.data)
-                    elif 'hh' in name:
+                    elif 'weight_hh' in name:
                         nn.init.orthogonal_(param.data)
-                elif 'linear' in name or 'projection' in name:
-                    nn.init.xavier_uniform_(param.weight)
-            if 'bias' in name:
-                nn.init.zeros_(param.data)
-                if 'lstm' in name:
-                    n = param.size(0)
-                    param.data[n//4:n//2].fill_(1.)
+                    elif 'bias' in name:
+                        nn.init.zeros_(param.data)
+                        # 忘却ゲートのバイアスを1に初期化
+                        n = param.size(0)
+                        param.data[n//4:n//2].fill_(1.)
     
     def forward(self, input_traj: torch.Tensor, 
                 obstacle_map: Optional[torch.Tensor] = None,
                 training: bool = True) -> Tuple[torch.Tensor, torch.Tensor]:
         
-        # ### 修正点 ###
-        # 入力次元を無理やり変更するのではなく、初期化時のinput_dimと一致するかチェックする
         if input_traj.shape[-1] != self.input_dim:
             raise ValueError(
                 f"SingularTrajectoryPredictorへの入力次元が不正です。"
@@ -161,9 +162,8 @@ class SingularTrajectoryPredictor(nn.Module):
         attended_seq, contrast_feature = self.ecam(encoded_seq, obstacle_map)
         
         # デコーダの初期状態を準備
-        # encoder_projection後のh_nを使うのではなく、LSTMの最終状態を正しく調整する
-        h_n_forward = h_n[-2,:,:] # last layer, forward direction
-        h_n_backward = h_n[-1,:,:] # last layer, backward direction
+        h_n_forward = h_n[-2,:,:] # 最終層の前方向
+        h_n_backward = h_n[-1,:,:] # 最終層の後ろ方向
         decoder_h = torch.cat([h_n_forward, h_n_backward], dim=1)
         decoder_h = self.encoder_projection(decoder_h).unsqueeze(0).repeat(self.num_layers, 1, 1)
 
@@ -175,15 +175,12 @@ class SingularTrajectoryPredictor(nn.Module):
         decoder_hidden = (decoder_h, decoder_c)
         
         predicted_traj = []
-        # デコーダの入力は、input_dimと同じ次元である必要がある
         decoder_input = input_traj[:, -1:, :]
         
         for _ in range(self.pred_len):
             decoder_output, decoder_hidden = self.decoder_lstm(decoder_input, decoder_hidden)
             pred_step = self.output_layer(decoder_output)
             predicted_traj.append(pred_step)
-            # 次の入力は、output_dimではなくinput_dimに合わせる必要がある
-            # ここではinput_dimとoutput_dimが同じなので問題ない
             decoder_input = pred_step
             
         predicted_traj = torch.cat(predicted_traj, dim=1)
@@ -192,8 +189,6 @@ class SingularTrajectoryPredictor(nn.Module):
 class TwoStageTrajectoryPredictor(nn.Module):
     """二段階軌跡予測器 - 短期予測と長期予測を組み合わせたモデル"""
     
-    # ### 修正点 ###
-    # ユーザーのデータ形式に合わせて、input_dimとoutput_dimのデフォルトを3に変更
     def __init__(self, input_dim: int = 3, hidden_dim: int = 64, output_dim: int = 3,
                  seq_len: int = 8, pred_len: int = 12, num_layers: int = 2, dropout: float = 0.1,
                  num_pedestrians: int = 5):
@@ -252,13 +247,9 @@ class TwoStageTrajectoryPredictor(nn.Module):
             input_traj, obstacle_map, training
         )
         
-        # ### 修正点 ###
-        # input_trajとshort_predの特徴量次元が(3で)一致しているため、そのまま結合できる
         extended_input = torch.cat([input_traj, short_pred], dim=1)
         
         # Stage 2: 長期予測
-        # 長期予測器は動的に作成せず、一貫したパラメータを持つメンバーとして定義する方が望ましいが、
-        # ここではシーケンス長が変わるため、元の実装を踏襲する
         long_term_model = SingularTrajectoryPredictor(
             input_dim=self.input_dim,
             hidden_dim=self.hidden_dim,
@@ -293,7 +284,6 @@ if __name__ == '__main__':
         batch_size = 4
         seq_len = 8
         pred_len = 12
-        # ユーザーのデータに合わせてinput_dim=3でテスト
         input_dim = 3
         num_pedestrians = 5
         
@@ -319,7 +309,6 @@ if __name__ == '__main__':
             print(f"   Stage1予測形状: {stage1_pred.shape} (期待値: {batch_size, pred_len//2, input_dim})")
             print(f"   コントラスト特徴量形状: {contrast.shape}")
 
-            # 形状チェック
             assert final_pred.shape == (batch_size, pred_len, input_dim)
             assert stage1_pred.shape == (batch_size, pred_len//2, input_dim)
 
