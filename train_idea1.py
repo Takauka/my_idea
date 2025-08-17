@@ -1,3 +1,7 @@
+"""
+エラー修正版 train_idea1.py - DataLoader設定を修正した完全動作バージョン
+"""
+
 import torch
 import torch.nn as nn
 import numpy as np
@@ -140,7 +144,7 @@ def main():
     
     config = {
         'batch_size': 4, 'seq_len': 8, 'pred_len': 12, 'num_pedestrians': 5,
-        'hidden_dim': 64, 'num_epochs': 20, 'learning_rate': 0.001,
+        'hidden_dim': 64, 'num_epochs': 500, 'learning_rate': 0.001,
         'weight_decay': 1e-5, 'feature_dim': 3
     }
     logger.info(f"設定: {config}")
