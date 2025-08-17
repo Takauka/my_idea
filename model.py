@@ -343,7 +343,7 @@ class TwoStageTrajectoryPredictor(nn.Module):
     
     def forward(self, input_traj: torch.Tensor, 
                 obstacle_map: Optional[torch.Tensor] = None,
-                training: bool = True) -> Tuple[torch.Tensor, torch.Tensor]:
+                training: bool = True) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         二段階予測を実行
         
@@ -354,6 +354,7 @@ class TwoStageTrajectoryPredictor(nn.Module):
             
         Returns:
             predicted_traj: (batch_size, pred_len, output_dim) - 予測軌跡
+            stage1_pred: (batch_size, short_pred_len, output_dim) - 短期予測
             contrast_feature: コントラスト学習用特徴量
         """
         
@@ -381,8 +382,13 @@ class TwoStageTrajectoryPredictor(nn.Module):
         
         print(f"短期予測結果形状: {short_pred.shape}")
         
-        # Stage 1の予測結果を元の軌跡に結合して拡張入力を作成
-        extended_input = torch.cat([input_traj, short_pred], dim=1)
+        # ================================================================= #
+        # ### ★★★★★ エラー修正箇所 ★★★★★ ###
+        # input_trajの特徴量次元をshort_predの次元(self.output_dim)に合わせてから結合する
+        processed_input_traj = input_traj[..., :self.output_dim]
+        extended_input = torch.cat([processed_input_traj, short_pred], dim=1)
+        # ================================================================= #
+        
         print(f"拡張入力形状: {extended_input.shape}")
         
         # Stage 2: 長期予測（拡張入力を使用）
@@ -512,7 +518,7 @@ def process_input_tensor(input_tensor: torch.Tensor, expected_dim: int = 2) -> t
             # パディング
             padding_size = expected_dim - current_feature_dim
             padding = torch.zeros(*input_tensor.shape[:-1], padding_size, 
-                                device=input_tensor.device, dtype=input_tensor.dtype)
+                                  device=input_tensor.device, dtype=input_tensor.dtype)
             input_tensor = torch.cat([input_tensor, padding], dim=-1)
     
     print(f"   最終形状: {input_tensor.shape}")
@@ -534,9 +540,9 @@ def test_models():
     input_traj_3d = torch.randn(batch_size, seq_len, input_dim)
     print(f"3次元テスト入力形状: {input_traj_3d.shape}")
     
-    # 4次元テンソルのテスト（複数歩行者）
+    # 4次元テンソルのテスト（複数歩行者、特徴量3次元）
     num_pedestrians = 3
-    input_traj_4d = torch.randn(batch_size, seq_len, num_pedestrians, input_dim)
+    input_traj_4d = torch.randn(batch_size, seq_len, num_pedestrians, input_dim + 1) # 特徴量を3に
     print(f"4次元テスト入力形状: {input_traj_4d.shape}")
     
     obstacle_map = torch.randn(batch_size, 2)
@@ -569,7 +575,7 @@ def test_models():
                 print(f"   戻り値{i}形状: {tensor.shape}")
         except Exception as e:
             print(f"❌ 4次元入力テスト失敗: {e}")
-        
+    
     except Exception as e:
         print(f"❌ TwoStageTrajectoryPredictor テスト失敗: {e}")
     
