@@ -1,3 +1,7 @@
+"""
+エラー修正版 model.py - 3次元データ対応・アテンション機構修正済み
+train_idea1.pyの最終版と連携して動作するバージョン
+"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -161,7 +165,6 @@ class SingularTrajectoryPredictor(nn.Module):
         attended_seq, contrast_feature = self.ecam(encoded_seq, obstacle_map)
         
         # デコーダの初期状態を、アテンション適用後の特徴量から生成する
-        # attended_seqの最後のタイムステップをコンテキストとして使用
         decoder_h = attended_seq[:, -1, :].unsqueeze(0).repeat(self.num_layers, 1, 1)
 
         # セル状態は、元のエンコーダの最終状態を再利用する
@@ -199,7 +202,6 @@ class TwoStageTrajectoryPredictor(nn.Module):
         self.short_pred_len = pred_len // 2
         self.long_pred_len = pred_len - self.short_pred_len
         
-        # ### ★★★★★ 修正点 ★★★★★ ###
         # パラメータをインスタンス変数として保存し、一貫性を保つ
         self.num_layers = num_layers
         self.dropout = dropout
@@ -254,7 +256,6 @@ class TwoStageTrajectoryPredictor(nn.Module):
         extended_input = torch.cat([input_traj, short_pred], dim=1)
         
         # Stage 2: 長期予測
-        # ### ★★★★★ 修正点 ★★★★★ ###
         # ハードコードされていた値をインスタンス変数から取得するように変更
         long_term_model = SingularTrajectoryPredictor(
             input_dim=self.input_dim,
