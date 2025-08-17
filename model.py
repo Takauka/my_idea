@@ -157,7 +157,6 @@ class SingularTrajectoryPredictor(nn.Module):
         encoded_seq, (h_n, c_n) = self.encoder_lstm(input_traj)
         encoded_seq = self.encoder_projection(encoded_seq)
         
-        # ### ★★★★★ 修正点 ★★★★★ ###
         # ECAM（アテンション）の計算結果を、後続のデコーダで正しく使用する
         attended_seq, contrast_feature = self.ecam(encoded_seq, obstacle_map)
         
@@ -172,7 +171,6 @@ class SingularTrajectoryPredictor(nn.Module):
         decoder_c = self.encoder_projection(decoder_c).unsqueeze(0).repeat(self.num_layers, 1, 1)
 
         decoder_hidden = (decoder_h, decoder_c)
-        # ### 修正ここまで ###
         
         predicted_traj = []
         decoder_input = input_traj[:, -1:, :]
@@ -201,15 +199,21 @@ class TwoStageTrajectoryPredictor(nn.Module):
         self.short_pred_len = pred_len // 2
         self.long_pred_len = pred_len - self.short_pred_len
         
+        # ### ★★★★★ 修正点 ★★★★★ ###
+        # パラメータをインスタンス変数として保存し、一貫性を保つ
+        self.num_layers = num_layers
+        self.dropout = dropout
+        self.num_pedestrians = num_pedestrians
+        
         self.short_term_predictor = SingularTrajectoryPredictor(
             input_dim=input_dim, 
             hidden_dim=hidden_dim,
             output_dim=output_dim,
             seq_len=seq_len,
             pred_len=self.short_pred_len,
-            num_layers=num_layers,
-            dropout=dropout,
-            num_pedestrians=num_pedestrians
+            num_layers=self.num_layers,
+            dropout=self.dropout,
+            num_pedestrians=self.num_pedestrians
         )
         
         self.feature_fusion = nn.Sequential(
@@ -250,15 +254,17 @@ class TwoStageTrajectoryPredictor(nn.Module):
         extended_input = torch.cat([input_traj, short_pred], dim=1)
         
         # Stage 2: 長期予測
+        # ### ★★★★★ 修正点 ★★★★★ ###
+        # ハードコードされていた値をインスタンス変数から取得するように変更
         long_term_model = SingularTrajectoryPredictor(
             input_dim=self.input_dim,
             hidden_dim=self.hidden_dim,
             output_dim=self.output_dim,
             seq_len=extended_input.shape[1],
             pred_len=self.long_pred_len,
-            num_layers=2,
-            dropout=0.1,
-            num_pedestrians=5
+            num_layers=self.num_layers,
+            dropout=self.dropout,
+            num_pedestrians=self.num_pedestrians
         ).to(extended_input.device)
         
         long_pred, long_contrast = long_term_model(
