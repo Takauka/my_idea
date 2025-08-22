@@ -138,7 +138,7 @@ def main():
         'seq_len': 8, 
         'pred_len': 12, 
         'num_pedestrians': 5,
-        'hidden_dim': 128, # 96から128に増やす
+        'hidden_dim': 128, # ### ★★★★★ 修正点 ★★★★★ ### モデルの表現力を向上
         'num_epochs': 500, 
         'learning_rate': 0.0005,
         'weight_decay': 1e-5, 
@@ -152,8 +152,10 @@ def main():
         try:
             from utils import DataLoader
             train_dataloader = DataLoader(
-                f_prefix='.', batch_size=config['batch_size'], 
-                seq_length=config['seq_len'], pred_len=config['pred_len']
+                f_prefix='.', 
+                batch_size=config['batch_size'], 
+                seq_length=config['seq_len'],
+                pred_len=config['pred_len'] 
             )
             logger.info("✅ DataLoader を使用します")
         except Exception as e:
@@ -173,6 +175,7 @@ def main():
     
     # ### ★★★★★ 修正点 ★★★★★ ###
     # スコアが停滞したら学習率を下げる、より賢いスケジューラに変更
+    # patience=5: 5エポック改善が見られなければ学習率を下げる
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
     
     logger.info("🎓 訓練開始")
@@ -228,7 +231,6 @@ def main():
             torch.save(model.state_dict(), 'best_model_social.pth')
             logger.info(f"🎉 新しいベストモデルを保存しました！ (ADE: {best_val_ade:.4f} at Epoch {best_epoch})")
 
-        # ### ★★★★★ 修正点 ★★★★★ ###
         # 検証ADEを元にスケジューラを更新
         scheduler.step(avg_val_ade)
         
