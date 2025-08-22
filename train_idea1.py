@@ -223,6 +223,7 @@ def main():
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
         logger.info(f"現在の学習率: {current_lr:.6f}")
+        scheduler.step()
 
     logger.info("🎉 訓練完了")
     torch.save(model.state_dict(), 'last_model_social.pth')
