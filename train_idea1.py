@@ -1,6 +1,7 @@
 """
-train_idea1.py (ベストモデル保存機能付き)
-各エポックで検証を行い、最も性能が良いモデルを保存し、最終的にその性能を報告する。
+train_idea1.py (最終改善版)
+学習プラトーを解消するため、賢い学習率スケジューラ(ReduceLROnPlateau)を導入。
+モデルの表現力も向上させています。
 """
 
 import torch
@@ -118,7 +119,7 @@ def create_zero_losses():
 
 def main():
     """メイン関数"""
-    logger.info("🚀 新モデル(ECAM+SocialSTGCNN)の訓練を開始します (ベストモデル保存機能付き)")
+    logger.info("🚀 新モデル(ECAM+SocialSTGCNN)の訓練を開始します (最終改善版)")
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info(f"使用デバイス: {device}")
@@ -133,14 +134,20 @@ def main():
         return
     
     config = {
-        'batch_size': 32, 'seq_len': 8, 'pred_len': 12, 'num_pedestrians': 5,
-        'hidden_dim': 64, 'num_epochs': 500, 'learning_rate': 0.0005,
-        'weight_decay': 1e-5, 'feature_dim': 3
+        'batch_size': 32, 
+        'seq_len': 8, 
+        'pred_len': 12, 
+        'num_pedestrians': 5,
+        'hidden_dim': 96, # ### ★★★★★ 修正点 ★★★★★ ### モデルの表現力を少し向上
+        'num_epochs': 500, 
+        'learning_rate': 0.0005,
+        'weight_decay': 1e-5, 
+        'feature_dim': 3
     }
     logger.info(f"設定: {config}")
     
     use_dataloader = check_dataloader_availability(config['pred_len'])
-    train_dataloader = None # train_dataloaderを初期化
+    train_dataloader = None
     if use_dataloader:
         try:
             from utils import DataLoader
@@ -163,7 +170,10 @@ def main():
     ).to(device)
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=config['learning_rate'], weight_decay=config['weight_decay'])
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.5)
+    
+    # ### ★★★★★ 修正点 ★★★★★ ###
+    # スコアが停滞したら学習率を下げる、より賢いスケジューラに変更
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, verbose=True)
     
     logger.info("🎓 訓練開始")
     
@@ -212,36 +222,29 @@ def main():
         avg_val_ade, avg_val_fde = np.mean(val_epoch_ades), np.mean(val_epoch_fdes)
         logger.info(f"Epoch {epoch+1} [検証] - ADE: {avg_val_ade:.4f}, FDE: {avg_val_fde:.4f}")
 
-        # ### ★★★★★ 修正点 ★★★★★ ###
-        # ベストモデルの保存
         if avg_val_ade < best_val_ade:
             best_val_ade = avg_val_ade
             best_epoch = epoch + 1
             torch.save(model.state_dict(), 'best_model_social.pth')
             logger.info(f"🎉 新しいベストモデルを保存しました！ (ADE: {best_val_ade:.4f} at Epoch {best_epoch})")
 
-        scheduler.step()
-        current_lr = scheduler.get_last_lr()[0]
-        logger.info(f"現在の学習率: {current_lr:.6f}")
-        scheduler.step()
-
+        # ### ★★★★★ 修正点 ★★★★★ ###
+        # 検証ADEを元にスケジューラを更新
+        scheduler.step(avg_val_ade)
+        
     logger.info("🎉 訓練完了")
     torch.save(model.state_dict(), 'last_model_social.pth')
     logger.info(f"✅ 最終モデル保存完了: last_model_social.pth")
     
-    # ### ★★★★★ 修正点 ★★★★★ ###
-    # 最終的なベストモデルの性能を表示
     if os.path.exists('best_model_social.pth'):
         logger.info("\n" + "="*60)
         logger.info("🏆 ベストモデルの最終評価 🏆")
         logger.info(f"   (Epoch {best_epoch} で達成)")
         
-        # ベストモデルの重みをロード
         model.load_state_dict(torch.load('best_model_social.pth'))
         
-        # 再度、検証データで評価
         final_eval_ades, final_eval_fdes = [], []
-        max_eval_batches = 50 # より多くのバッチで評価
+        max_eval_batches = 50
         model.eval()
         for _ in range(max_eval_batches):
             input_traj, target_traj, obstacle_map = create_dummy_data(**config)
@@ -250,8 +253,7 @@ def main():
             final_eval_ades.append(metrics['ade'])
             final_eval_fdes.append(metrics['fde'])
             
-        final_ade = np.mean(final_eval_ades)
-        final_fde = np.mean(final_eval_fdes)
+        final_ade, final_fde = np.mean(final_eval_ades), np.mean(final_eval_fdes)
         
         logger.info(f"   >> 最終ADE: {final_ade:.4f}")
         logger.info(f"   >> 最終FDE: {final_fde:.4f}")
