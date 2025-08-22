@@ -1,12 +1,9 @@
-"""
-新しい二段階モデル(Social-STGCNN対応)用の訓練スクリプト
-"""
-
 import torch
 import torch.nn as nn
 import numpy as np
 import logging
 import os
+import time
 from typing import Dict, Any, Tuple, Optional
 
 # ログ設定
@@ -16,7 +13,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-def create_dummy_data(batch_size=4, seq_len=8, pred_len=12, num_pedestrians=5, feature_dim=3):
+def create_dummy_data(batch_size=32, seq_len=8, pred_len=12, num_pedestrians=5, feature_dim=3):
     """3次元のダミーデータを作成"""
     input_trajectories = torch.randn(batch_size, seq_len, num_pedestrians, feature_dim)
     target_trajectories = torch.randn(batch_size, pred_len, num_pedestrians, feature_dim)
@@ -30,7 +27,6 @@ def check_dataloader_availability(pred_len):
         from utils import DataLoader
         data_dirs = ['data/train', 'data/test', 'data/validation']
         if not any(os.path.exists(d) and os.listdir(d) for d in data_dirs): return False
-        # DataLoaderの初期化をテスト
         loader = DataLoader(f_prefix='.', batch_size=2, seq_length=8, pred_len=pred_len)
         return True
     except Exception:
@@ -42,7 +38,6 @@ def process_dataloader_batch(dataloader, pred_len):
         x_batch, y_batch, _, _, _, _ = dataloader.next_batch()
         if not isinstance(x_batch, (list, np.ndarray)) or len(x_batch) == 0: return None
 
-        # (seq_len, batch, num_peds, features) -> (batch, seq_len, num_peds, features)
         input_trajectories = torch.from_numpy(np.array(x_batch)).float().permute(1, 0, 2, 3)
         target_trajectories = torch.from_numpy(np.array(y_batch)).float().permute(1, 0, 2, 3)
         
@@ -67,16 +62,12 @@ def safe_train_step(model, optimizer, input_traj, target_traj, obstacle_map,
     optimizer.zero_grad()
     
     try:
-        final_pred, stage1_pred, contrast_feature = model(input_traj, obstacle_map)
-        
-        # ターゲット歩行者(index 0)の正解データをスライス
+        final_pred, stage1_pred, _ = model(input_traj, obstacle_map)
         target_traj_for_loss = target_traj[:, :, 0, :]
         
-        # 損失計算
-        main_loss = nn.functional.mse_loss(final_pred, target_traj_for_loss)
-        stage1_loss = nn.functional.mse_loss(stage1_pred, target_traj_for_loss[:, :stage1_pred.shape[1], :])
+        main_loss = F.mse_loss(final_pred, target_traj_for_loss)
+        stage1_loss = F.mse_loss(stage1_pred, target_traj_for_loss[:, :stage1_pred.shape[1], :])
         
-        # 安定した学習のため、コントラスト項は含めない
         total_loss = main_loss + 0.3 * stage1_loss
         
         if torch.isnan(total_loss):
@@ -87,16 +78,13 @@ def safe_train_step(model, optimizer, input_traj, target_traj, obstacle_map,
         optimizer.step()
         
         with torch.no_grad():
-            # 座標(x,y)のみを使って誤差を計算
             displacement_errors = torch.norm(final_pred[..., :2] - target_traj_for_loss[..., :2], dim=-1)
             ade = displacement_errors.mean()
             fde = torch.norm(final_pred[:, -1, :2] - target_traj_for_loss[:, -1, :2], dim=-1).mean()
         
         return {'total_loss': total_loss.item(), 'ade': ade.item(), 'fde': fde.item()}
     except Exception as e:
-        logger.error(f"❌ 訓練ステップでエラー: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.error(f"❌ 訓練ステップでエラー: {e}", exc_info=True)
         return create_zero_losses()
 
 def create_zero_losses():
@@ -104,7 +92,7 @@ def create_zero_losses():
 
 def main():
     """メイン関数"""
-    logger.info("🚀 新モデル(Social-STGCNN対応)での訓練を開始します")
+    logger.info("🚀 新モデル(ECAM+SocialSTGCNN)の訓練を開始します (学習率スケジューラ導入版)")
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info(f"使用デバイス: {device}")
@@ -119,13 +107,13 @@ def main():
         return
     
     config = {
-        'batch_size': 4, 
+        'batch_size': 32, # GPUの性能を引き出すために少し増やす
         'seq_len': 8, 
         'pred_len': 12, 
         'num_pedestrians': 5,
         'hidden_dim': 64, 
         'num_epochs': 500, 
-        'learning_rate': 0.001,
+        'learning_rate': 0.0005, # 初期学習率を少し下げる
         'weight_decay': 1e-5, 
         'feature_dim': 3
     }
@@ -136,7 +124,6 @@ def main():
     if use_dataloader:
         try:
             from utils import DataLoader
-            # DataLoader初期化時に、予測長(pred_len)を正しく渡す
             train_dataloader = DataLoader(
                 f_prefix='.', 
                 batch_size=config['batch_size'], 
@@ -152,15 +139,16 @@ def main():
         logger.info("📊 ダミーデータを使用します")
     
     model = TwoStageTrajectoryPredictor(
-        input_dim=config['feature_dim'],
-        hidden_dim=config['hidden_dim'],
-        output_dim=config['feature_dim'],
-        seq_len=config['seq_len'],
-        pred_len=config['pred_len'],
-        num_pedestrians=config['num_pedestrians']
+        input_dim=config['feature_dim'], hidden_dim=config['hidden_dim'],
+        output_dim=config['feature_dim'], seq_len=config['seq_len'],
+        pred_len=config['pred_len'], num_pedestrians=config['num_pedestrians']
     ).to(device)
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=config['learning_rate'], weight_decay=config['weight_decay'])
+    
+    # ### ★★★★★ 修正点 ★★★★★ ###
+    # 学習率スケジューラを定義 (50エポックごとに学習率を半分にする)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.5)
     
     logger.info("🎓 訓練開始")
     
@@ -174,9 +162,7 @@ def main():
             if use_dataloader:
                 batch_data = process_dataloader_batch(train_dataloader, config['pred_len'])
                 if batch_data is None:
-                    if train_dataloader.num_batches == 0:
-                        logger.warning("DataLoaderにバッチがありません。訓練を終了します。")
-                        break
+                    if train_dataloader.num_batches == 0: break
                     train_dataloader.reset_batch_pointer()
                     continue
                 input_traj = batch_data['input_trajectories'].to(device)
@@ -203,7 +189,13 @@ def main():
             continue
 
         avg_loss, avg_ade, avg_fde = np.mean(epoch_losses), np.mean(epoch_ades), np.mean(epoch_fdes)
-        logger.info(f"Epoch {epoch+1} 結果 - Loss: {avg_loss:.4f}, ADE: {avg_ade:.4f}, FDE: {avg_fde:.4f}")
+        
+        # ### ★★★★★ 修正点 ★★★★★ ###
+        # エポックの最後にスケジューラを更新し、現在の学習率を表示
+        scheduler.step()
+        current_lr = scheduler.get_last_lr()[0]
+        
+        logger.info(f"Epoch {epoch+1} 結果 - Loss: {avg_loss:.4f}, ADE: {avg_ade:.4f}, FDE: {avg_fde:.4f}, LR: {current_lr:.6f}")
 
     logger.info("🎉 訓練完了")
     torch.save(model.state_dict(), 'final_model_social.pth')
