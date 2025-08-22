@@ -1,6 +1,7 @@
 """
-test_idea1.py (モデル評価用スクリプト)
-学習済みモデル（.pthファイル）をロードし、その性能（ADE/FDE）を評価します。
+test_idea1.py (実データ評価版)
+学習済みモデル（.pthファイル）をロードし、
+実際のETH/UCYテストデータセットを使って性能（ADE/FDE）を評価します。
 """
 
 import torch
@@ -19,12 +20,33 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-def create_dummy_data(batch_size=32, seq_len=8, pred_len=12, num_pedestrians=5, feature_dim=3):
-    """評価用の3次元ダミーデータを作成"""
-    input_trajectories = torch.randn(batch_size, seq_len, num_pedestrians, feature_dim)
-    target_trajectories = torch.randn(batch_size, pred_len, num_pedestrians, feature_dim)
-    obstacle_maps = torch.randn(batch_size, 2)
-    return input_trajectories, target_trajectories, obstacle_maps
+def process_dataloader_batch(dataloader, pred_len):
+    """DataLoaderからバッチを安全に取得し、形状を検証"""
+    try:
+        # DataLoaderから次のバッチを取得
+        x_batch, y_batch, _, _, _, _ = dataloader.next_batch()
+        if not isinstance(x_batch, (list, np.ndarray)) or len(x_batch) == 0: return None
+
+        # NumPy配列をTensorに変換し、形状を整える
+        # (seq_len, batch, num_peds, features) -> (batch, seq_len, num_peds, features)
+        input_trajectories = torch.from_numpy(np.array(x_batch)).float().permute(1, 0, 2, 3)
+        target_trajectories = torch.from_numpy(np.array(y_batch)).float().permute(1, 0, 2, 3)
+        
+        # ターゲットのシーケンス長が期待値と一致するか検証
+        if target_trajectories.shape[1] != pred_len:
+            logger.warning(f"DataLoaderが返すターゲット長({target_trajectories.shape[1]})が期待値({pred_len})と異なります。スキップします。")
+            return None
+            
+        # 障害物マップはダミーで生成（ECAMの入力として必要）
+        obstacle_maps = torch.randn(input_trajectories.shape[0], 2)
+        
+        return {
+            'input_trajectories': input_trajectories,
+            'target_trajectories': target_trajectories,
+            'obstacle_map': obstacle_maps
+        }
+    except Exception:
+        return None
 
 def safe_eval_step(model, input_traj, target_traj, obstacle_map):
     """安全な検証ステップ（勾配計算なし）"""
@@ -49,27 +71,26 @@ def safe_eval_step(model, input_traj, target_traj, obstacle_map):
 
 def main(args):
     """メイン関数"""
-    logger.info("🚀 モデルの評価を開始します")
+    logger.info("🚀 モデルの評価を開始します (実データ使用)")
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info(f"使用デバイス: {device}")
     
-    # model.pyが存在するか確認
     try:
         from model import TwoStageTrajectoryPredictor
-    except ImportError:
-        logger.error("❌ model.py が見つかりません。train_idea1.pyと同じ階層に配置してください。")
+        from utils import DataLoader
+    except ImportError as e:
+        logger.error(f"❌ 必要なモジュールが見つかりません: {e}")
+        logger.error("model.py と utils.py が同じ階層にあるか確認してください。")
         return
 
-    # モデルの重みファイルが存在するか確認
     if not os.path.exists(args.model_path):
         logger.error(f"❌ モデルファイルが見つかりません: {args.model_path}")
-        logger.error("train_idea1.pyを実行して、先にモデルを学習・保存してください。")
         return
 
-    # --- モデルの構成を訓練時と合わせる ---
+    # --- モデルとデータの構成を訓練時と合わせる ---
     config = {
-        'batch_size': 32, 
+        'batch_size': 64, # 評価時は大きめのバッチサイズでもOK
         'seq_len': 8, 
         'pred_len': 12, 
         'num_pedestrians': 5,
@@ -78,6 +99,24 @@ def main(args):
     }
     logger.info(f"テスト設定: {config}")
     
+    # ### ★★★★★ 修正点 ★★★★★ ###
+    # 実際のテストデータセットをロード
+    logger.info("📖 テストデータセットを読み込んでいます...")
+    try:
+        test_dataloader = DataLoader(
+            f_prefix='.', 
+            batch_size=config['batch_size'], 
+            seq_length=config['seq_len'],
+            pred_len=config['pred_len'],
+            forcePreProcess=False, 
+            # infer=True を設定してテストモードでデータをロード
+            infer=True 
+        )
+        logger.info(f"✅ テストデータ読み込み完了: {test_dataloader.num_batches} バッチ")
+    except Exception as e:
+        logger.error(f"❌ DataLoaderの初期化に失敗しました: {e}")
+        return
+
     # モデルのアーキテクチャを定義
     model = TwoStageTrajectoryPredictor(
         input_dim=config['feature_dim'], hidden_dim=config['hidden_dim'],
@@ -92,18 +131,20 @@ def main(args):
     # --- 評価ループ ---
     logger.info("📊 評価を開始...")
     final_eval_ades, final_eval_fdes = [], []
-    max_eval_batches = 100 # 評価に使用するバッチ数
     
-    for i in range(max_eval_batches):
-        input_traj, target_traj, obstacle_map = create_dummy_data(**config)
-        input_traj, target_traj, obstacle_map = input_traj.to(device), target_traj.to(device), obstacle_map.to(device)
+    # DataLoaderの全バッチに対して評価を実行
+    for i in range(test_dataloader.num_batches):
+        batch_data = process_dataloader_batch(test_dataloader, config['pred_len'])
+        if batch_data is None: continue
+            
+        input_traj, target_traj, obstacle_map = [v.to(device) for v in batch_data.values()]
         
         metrics = safe_eval_step(model, input_traj, target_traj, obstacle_map)
         final_eval_ades.append(metrics['ade'])
         final_eval_fdes.append(metrics['fde'])
 
         if (i + 1) % 10 == 0:
-            logger.info(f"  バッチ {i+1}/{max_eval_batches} 完了...")
+            logger.info(f"  バッチ {i+1}/{test_dataloader.num_batches} 完了...")
 
     final_ade = np.mean(final_eval_ades)
     final_fde = np.mean(final_eval_fdes)
@@ -116,10 +157,9 @@ def main(args):
     logger.info("="*60)
 
 if __name__ == "__main__":
-    # コマンドライン引数の設定
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model_path', type=str, default='last_model_social.pth',
-                        help='評価する学習済みモデルのパス')
+    parser.add_argument('--model_path', type=str, default='best_model_social.pth',
+                        help='評価する学習済みモデルのパス (best_model_social.pth を推奨)')
     args = parser.parse_args()
     
     main(args)
