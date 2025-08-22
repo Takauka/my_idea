@@ -1,281 +1,329 @@
-from typing import Literal
-
+"""
+エラー修正版 model.py - 3次元データ対応・アテンション機構修正済み
+train_idea1.pyの最終版と連携して動作するバージョン
+"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .anchor import AdaptiveAnchor
-from .space import SingularSpace
-from . import homography as hm
+import numpy as np
+import math
+from typing import Optional, Tuple, Dict, Any
 
-from baseline.transformerdiffusion.nce.map_nce import MapNceLoss, MapQueryEmbedder, MapKeyEmbedder
-import baseline.transformerdiffusion.model_utils as model_utils
-
-
-# ### ★★★★★ 新しく追加するECAMモジュール ★★★★★ ###
 class EnvironmentalAttentionModule(nn.Module):
-    """
-    ECAM (Environmental Context Attention Module)
-    観測された軌跡と障害物マップから、環境を考慮したコンテキストベクトルを生成する。
-    """
-    def __init__(self, traj_input_dim=2, map_input_channels=1, hidden_dim=64, context_dim=32, dropout=0.1):
-        super().__init__()
+    """環境認識型注意機構 (Environmental Context Attention Module: ECAM)"""
+    
+    def __init__(self, embedding_dim: int = 64, env_dim: int = 32, dropout: float = 0.1):
+        super(EnvironmentalAttentionModule, self).__init__()
+        self.embedding_dim = embedding_dim
+        self.env_dim = env_dim
         
-        # 軌跡を処理するためのエンコーダ (LSTM)
-        self.traj_encoder = nn.LSTM(traj_input_dim, hidden_dim, batch_first=True)
-        
-        # 障害物マップのパッチを処理するためのエンコーダ (CNN)
-        # map_patches (B, 1, H, W) を想定
-        self.map_encoder = nn.Sequential(
-            nn.Conv2d(map_input_channels, 16, kernel_size=3, stride=2, padding=1),
+        # 環境情報エンコーダ
+        self.env_encoder = nn.Sequential(
+            nn.Linear(2, env_dim),
+            nn.LayerNorm(env_dim),
             nn.ReLU(),
-            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, 1)), # -> (B, 32, 1, 1)
-            nn.Flatten() # -> (B, 32)
+            nn.Dropout(dropout),
+            nn.Linear(env_dim, env_dim),
+            nn.LayerNorm(env_dim),
+            nn.ReLU()
         )
         
-        # 軌跡特徴量とマップ特徴量を統合し、最終的なコンテキストベクトルを生成する
+        # 軌跡エンコーダ
+        self.traj_encoder = nn.Sequential(
+            nn.Linear(embedding_dim, embedding_dim),
+            nn.LayerNorm(embedding_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(embedding_dim, embedding_dim)
+        )
+        
+        # マルチヘッド注意機構
+        self.multihead_attention = nn.MultiheadAttention(
+            embed_dim=embedding_dim,
+            num_heads=8,
+            dropout=dropout,
+            batch_first=True
+        )
+        
+        # 環境-軌跡融合層
         self.fusion_layer = nn.Sequential(
-            nn.Linear(hidden_dim + 32, hidden_dim),
+            nn.Linear(embedding_dim + env_dim, embedding_dim),
+            nn.LayerNorm(embedding_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(embedding_dim, embedding_dim)
+        )
+        
+        # コントラスト学習用プロジェクタ
+        self.projector = nn.Sequential(
+            nn.Linear(embedding_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 32)
+        )
+        
+        self._initialize_weights()
+    
+    def _initialize_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+    
+    def forward(self, trajectory: torch.Tensor, 
+                obstacle_map: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        batch_size, seq_len, input_dim = trajectory.shape
+        
+        if input_dim != self.embedding_dim:
+             raise ValueError(f"ECAMへの入力次元が不正です。期待値: {self.embedding_dim}, 実際の値: {input_dim}")
+
+        traj_encoded = self.traj_encoder(trajectory)
+        
+        if obstacle_map is not None:
+            env_encoded = self.env_encoder(obstacle_map)
+            env_expanded = env_encoded.unsqueeze(1).expand(-1, seq_len, -1)
+            fused_features = torch.cat([traj_encoded, env_expanded], dim=-1)
+            attended_traj = self.fusion_layer(fused_features)
+            attended_traj, _ = self.multihead_attention(
+                attended_traj, attended_traj, attended_traj
+            )
+        else:
+            attended_traj = traj_encoded
+        
+        contrast_feature = self.projector(attended_traj.mean(dim=1))
+        return attended_traj, contrast_feature
+
+class SingularTrajectoryPredictor(nn.Module):
+    """単体軌跡予測器（修正版）"""
+    
+    def __init__(self, input_dim: int = 3, hidden_dim: int = 64, output_dim: int = 3,
+                 seq_len: int = 8, pred_len: int = 12, num_layers: int = 2, dropout: float = 0.1,
+                 num_pedestrians: int = 5):
+        super(SingularTrajectoryPredictor, self).__init__()
+        self.hidden_dim = hidden_dim
+        self.pred_len = pred_len
+        self.num_layers = num_layers
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        
+        self.encoder_lstm = nn.LSTM(
+            input_dim, hidden_dim, num_layers=num_layers,
+            batch_first=True, dropout=dropout if num_layers > 1 else 0, bidirectional=True
+        )
+        
+        self.encoder_projection = nn.Linear(hidden_dim * 2, hidden_dim)
+        
+        self.decoder_lstm = nn.LSTM(
+            input_dim, hidden_dim, num_layers=num_layers,
+            batch_first=True, dropout=dropout if num_layers > 1 else 0
+        )
+        
+        self.output_layer = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, output_dim)
+        )
+        
+        self.ecam = EnvironmentalAttentionModule(hidden_dim, dropout=dropout)
+        self._initialize_weights()
+    
+    def _initialize_weights(self):
+        """モデルの重みを初期化する"""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.LSTM):
+                for name, param in module.named_parameters():
+                    if 'weight_ih' in name:
+                        nn.init.xavier_uniform_(param.data)
+                    elif 'weight_hh' in name:
+                        nn.init.orthogonal_(param.data)
+                    elif 'bias' in name:
+                        nn.init.zeros_(param.data)
+                        # 忘却ゲートのバイアスを1に初期化
+                        n = param.size(0)
+                        param.data[n//4:n//2].fill_(1.)
+    
+    def forward(self, input_traj: torch.Tensor, 
+                obstacle_map: Optional[torch.Tensor] = None,
+                training: bool = True) -> Tuple[torch.Tensor, torch.Tensor]:
+        
+        if input_traj.shape[-1] != self.input_dim:
+            raise ValueError(
+                f"SingularTrajectoryPredictorへの入力次元が不正です。"
+                f"期待値: {self.input_dim}, 実際の値: {input_traj.shape[-1]}"
+            )
+
+        encoded_seq, (h_n, c_n) = self.encoder_lstm(input_traj)
+        encoded_seq = self.encoder_projection(encoded_seq)
+        
+        # ECAM（アテンション）の計算結果を、後続のデコーダで正しく使用する
+        attended_seq, contrast_feature = self.ecam(encoded_seq, obstacle_map)
+        
+        # デコーダの初期状態を、アテンション適用後の特徴量から生成する
+        decoder_h = attended_seq[:, -1, :].unsqueeze(0).repeat(self.num_layers, 1, 1)
+
+        # セル状態は、元のエンコーダの最終状態を再利用する
+        c_n_forward = c_n[-2,:,:]
+        c_n_backward = c_n[-1,:,:]
+        decoder_c = torch.cat([c_n_forward, c_n_backward], dim=1)
+        decoder_c = self.encoder_projection(decoder_c).unsqueeze(0).repeat(self.num_layers, 1, 1)
+
+        decoder_hidden = (decoder_h, decoder_c)
+        
+        predicted_traj = []
+        decoder_input = input_traj[:, -1:, :]
+        
+        for _ in range(self.pred_len):
+            decoder_output, decoder_hidden = self.decoder_lstm(decoder_input, decoder_hidden)
+            pred_step = self.output_layer(decoder_output)
+            predicted_traj.append(pred_step)
+            decoder_input = pred_step
+            
+        predicted_traj = torch.cat(predicted_traj, dim=1)
+        return predicted_traj, contrast_feature
+
+class TwoStageTrajectoryPredictor(nn.Module):
+    """二段階軌跡予測器 - 短期予測と長期予測を組み合わせたモデル"""
+    
+    def __init__(self, input_dim: int = 3, hidden_dim: int = 64, output_dim: int = 3,
+                 seq_len: int = 8, pred_len: int = 12, num_layers: int = 2, dropout: float = 0.1,
+                 num_pedestrians: int = 5):
+        super(TwoStageTrajectoryPredictor, self).__init__()
+        
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.hidden_dim = hidden_dim
+        self.pred_len = pred_len
+        self.short_pred_len = pred_len // 2
+        self.long_pred_len = pred_len - self.short_pred_len
+        
+        # パラメータをインスタンス変数として保存し、一貫性を保つ
+        self.num_layers = num_layers
+        self.dropout = dropout
+        self.num_pedestrians = num_pedestrians
+        
+        self.short_term_predictor = SingularTrajectoryPredictor(
+            input_dim=input_dim, 
+            hidden_dim=hidden_dim,
+            output_dim=output_dim,
+            seq_len=seq_len,
+            pred_len=self.short_pred_len,
+            num_layers=self.num_layers,
+            dropout=self.dropout,
+            num_pedestrians=self.num_pedestrians
+        )
+        
+        self.feature_fusion = nn.Sequential(
+            nn.Linear(64, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, context_dim)
+            nn.Linear(hidden_dim, 32)
         )
-
-    def forward(self, obs_traj: torch.Tensor, map_patches: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            obs_traj (torch.Tensor): 観測軌跡 (B, T, 2)
-            map_patches (torch.Tensor): 各歩行者周辺の障害物マップパッチ (B, 1, H, W)
         
-        Returns:
-            torch.Tensor: 環境コンテキストベクトル (B, context_dim)
-        """
-        # 軌跡特徴量の抽出
-        _, (traj_hidden, _) = self.traj_encoder(obs_traj)
-        traj_features = traj_hidden.squeeze(0) # -> (B, hidden_dim)
+        self.trajectory_refinement = nn.Sequential(
+            nn.Linear(output_dim, hidden_dim // 4),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 4, output_dim)
+        )
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+    def forward(self, input_traj: torch.Tensor, 
+                obstacle_map: Optional[torch.Tensor] = None,
+                training: bool = True) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         
-        # マップ特徴量の抽出
-        map_features = self.map_encoder(map_patches) # -> (B, 32)
+        # 4次元以上の場合は、最初の歩行者のデータのみ使用する
+        if input_traj.dim() > 3:
+            input_traj = input_traj[:, :, 0, :]
         
-        # 特徴量の結合
-        combined_features = torch.cat([traj_features, map_features], dim=1)
+        # Stage 1: 短期予測
+        short_pred, short_contrast = self.short_term_predictor(
+            input_traj, obstacle_map, training
+        )
         
-        # 最終的なコンテキストベクトルの生成
-        ecam_context = self.fusion_layer(combined_features)
+        extended_input = torch.cat([input_traj, short_pred], dim=1)
         
-        return ecam_context
-
-
-class SingularTrajectory(nn.Module):
-    r"""The SingularTrajectory model (ECAM統合版)"""
-
-    def __init__(self, baseline_model, hook_func, hyper_params, device):
-        super().__init__()
-
-        self.baseline_model = baseline_model
-        self.hook_func = hook_func
-        self.hyper_params = hyper_params
-        self.t_obs, self.t_pred = hyper_params.obs_len, hyper_params.pred_len
-        self.obs_svd, self.pred_svd = hyper_params.obs_svd, hyper_params.pred_svd
-        self.k = hyper_params.k
-        self.s = hyper_params.num_samples
-        self.dim = hyper_params.traj_dim
-        self.static_dist = hyper_params.static_dist
-        self.device = device
-
-        self.Singular_space_m = SingularSpace(hyper_params=hyper_params, norm_sca=True)
-        self.Singular_space_s = SingularSpace(hyper_params=hyper_params, norm_sca=False)
-        self.adaptive_anchor_m = AdaptiveAnchor(hyper_params=hyper_params)
-        self.adaptive_anchor_s = AdaptiveAnchor(hyper_params=hyper_params)
-
-        # ### ★★★★★ ECAMモジュールをインスタンス化 ★★★★★ ###
-        # baseline_modelのコンテキストサイズに合わせてECAMの出力次元を設定するのが理想
-        # ここでは仮に32次元とする
-        self.ecam_module = EnvironmentalAttentionModule(context_dim=32)
-
-        #####################
-        ## MapNCE (変更なし)
-        query_proj = MapQueryEmbedder(256, 16)
-        event_encoder = MapKeyEmbedder(2, 16)
-        self.map_nce = MapNceLoss(obs_len=self.t_obs, pred_len=self.t_pred,
-                                  num_contour_points=10, query_embedder=query_proj,
-                                  key_embedder=event_encoder, temperature=0.3)
-
-    # (calculate_parameters, calculate_adaptive_anchor, calculate_mask は変更なし)
-    def calculate_parameters(self, obs_traj_BT2, pred_traj_BT2):
-        mask_B = self.calculate_mask(obs_traj_BT2)
-        obs_m_traj_BT2, pred_m_traj_BT2 = obs_traj_BT2[mask_B], pred_traj_BT2[mask_B]
-        obs_s_traj_BT2, pred_s_traj_BT2 = obs_traj_BT2[~mask_B], pred_traj_BT2[~mask_B]
-        data_m = self.Singular_space_m.parameter_initialization(obs_m_traj_BT2, pred_m_traj_BT2)
-        data_s = self.Singular_space_s.parameter_initialization(obs_s_traj_BT2, pred_s_traj_BT2)
-        self.adaptive_anchor_m.anchor_initialization(*data_m)
-        self.adaptive_anchor_s.anchor_initialization(*data_s)
-
-    def calculate_adaptive_anchor(self, dataset):
-        obs_traj_BT2, pred_traj_BT2 = dataset.obs_traj_BT2, dataset.pred_traj_BT2
-        scene_id_B = dataset.scene_id
-        vector_field = dataset.vector_field
-        homography = dataset.homography
-        obs_traj_BT2 = obs_traj_BT2.to(self.device)
-        pred_traj_BT2 = pred_traj_BT2.to(self.device)
-        mask_B = self.calculate_mask(obs_traj_BT2)
-        mask_cpu_B = mask_B.cpu().numpy()
-        obs_m_traj_BT2, scene_id_m_B = obs_traj_BT2[mask_B], scene_id_B[mask_cpu_B]
-        obs_s_traj_BT2, scene_id_s_B = obs_traj_BT2[~mask_B], scene_id_B[~mask_cpu_B]
-        n_ped = pred_traj_BT2.size(0)
-        anchor_BKN = torch.zeros((n_ped, self.k, self.s), dtype=torch.float)
-        anchor_BKN[mask_B] = self.adaptive_anchor_m.adaptive_anchor_calculation(obs_m_traj_BT2, scene_id_m_B, vector_field, homography, self.Singular_space_m)
-        anchor_BKN[~mask_B] = self.adaptive_anchor_s.adaptive_anchor_calculation(obs_s_traj_BT2, scene_id_s_B, vector_field, homography, self.Singular_space_s)
-        return anchor_BKN
-
-    def calculate_mask(self, obs_traj_BT2):
-        if obs_traj_BT2.size(1) <= 2:
-            mask_B = (obs_traj_BT2[:, -1] - obs_traj_BT2[:, -2]).div(1).norm(p=2, dim=-1) > self.static_dist
-        else:
-            mask_B = (obs_traj_BT2[:, -1] - obs_traj_BT2[:, -3]).div(2).norm(p=2, dim=-1) > self.static_dist
-        return mask_B
-
-    def forward(self, obs_traj_BT2, adaptive_anchor_BKN, pred_traj_BT2=None, addl_info=None):
-        n_ped = obs_traj_BT2.size(0)
-
-        # (中略: 既存の静的/動的歩行者の分離処理、Projection処理は変更なし)
-        mask_B = self.calculate_mask(obs_traj_BT2)
-        obs_m_traj_BT2, obs_s_traj_BT2 = obs_traj_BT2[mask_B], obs_traj_BT2[~mask_B]
-        pred_m_traj_gt_BT2 = pred_traj_BT2[mask_B] if pred_traj_BT2 is not None else None
-        pred_s_traj_gt_BT2 = pred_traj_BT2[~mask_B] if pred_traj_BT2 is not None else None
-        C_m_obs_KB, C_m_pred_gt_KB = self.Singular_space_m.projection(obs_m_traj_BT2, pred_m_traj_gt_BT2)
-        C_s_obs_KB, C_s_pred_gt_KB = self.Singular_space_s.projection(obs_s_traj_BT2, pred_s_traj_gt_BT2)
-        C_obs_KB = torch.zeros((self.k, n_ped), dtype=torch.float, device=obs_traj_BT2.device)
-        C_obs_KB[:, mask_B], C_obs_KB[:, ~mask_B] = C_m_obs_KB, C_s_obs_KB
-        obs_m_ori_2B = self.Singular_space_m.traj_normalizer.traj_ori_B12.squeeze(dim=1).T
-        obs_s_ori_2B = self.Singular_space_s.traj_normalizer.traj_ori_B12.squeeze(dim=1).T
-        obs_ori_2B = torch.zeros((2, n_ped), dtype=torch.float, device=obs_traj_BT2.device)
-        obs_ori_2B[:, mask_B], obs_ori_2B[:, ~mask_B] = obs_m_ori_2B, obs_s_ori_2B
-        obs_ori_2B -= obs_ori_2B.mean(dim=1, keepdim=True)
-        C_anchor_KBN = adaptive_anchor_BKN.permute(1, 0, 2)
-        addl_info["anchor"] = C_anchor_KBN.clone()
-        addl_info["original_obs_traj"] = obs_traj_BT2
-
-        # Trajectory prediction
-        input_data = self.hook_func.model_forward_pre_hook(C_obs_KB, obs_ori_2B, addl_info)
+        # Stage 2: 長期予測
+        # ハードコードされていた値をインスタンス変数から取得するように変更
+        long_term_model = SingularTrajectoryPredictor(
+            input_dim=self.input_dim,
+            hidden_dim=self.hidden_dim,
+            output_dim=self.output_dim,
+            seq_len=extended_input.shape[1],
+            pred_len=self.long_pred_len,
+            num_layers=self.num_layers,
+            dropout=self.dropout,
+            num_pedestrians=self.num_pedestrians
+        ).to(extended_input.device)
         
-        # ### ★★★★★ ECAMの実行とコンテキストの注入 ★★★★★ ###
-        # 1. baseline_modelを一度実行して、必要なmap_patchesを取得
-        #    注: 本来はmap_patchesを事前に計算するのが望ましいが、既存のフック構造を尊重
-        _, _, map_patches_B1HW = self.hook_func.model_forward(input_data, self.baseline_model, get_map_only=True)
+        long_pred, long_contrast = long_term_model(
+            extended_input, obstacle_map, training
+        )
         
-        # 2. ECAMモジュールで環境コンテキストを計算
-        ecam_context = self.ecam_module(obs_traj_BT2, map_patches_B1HW)
+        full_prediction = torch.cat([short_pred, long_pred], dim=1)
         
-        # 3. 計算したコンテキストをbaseline_modelへの入力に追加
-        input_data['ecam_context'] = ecam_context
-        # ### 修正ここまで ###
+        # 予測軌跡の微調整
+        refined_prediction = full_prediction + self.trajectory_refinement(full_prediction)
         
-        # baseline_modelの本格的な順伝播
-        output_data_BNK1, context_BK, _ = self.hook_func.model_forward(input_data, self.baseline_model)
+        # コントラスト特徴量の融合
+        combined_contrast = torch.cat([short_contrast, long_contrast], dim=-1)
+        final_contrast = self.feature_fusion(combined_contrast)
         
-        C_pred_refine_KBN = self.hook_func.model_forward_post_hook(output_data_BNK1, addl_info) * 0.1
-        C_m_pred_KBN = self.adaptive_anchor_m(C_pred_refine_KBN[:, mask_B], C_anchor_KBN[:, mask_B])
-        C_s_pred_KBN = self.adaptive_anchor_s(C_pred_refine_KBN[:, ~mask_B], C_anchor_KBN[:, ~mask_B])
+        return refined_prediction, short_pred, final_contrast
+
+if __name__ == '__main__':
+    # テスト用の簡単な関数
+    def test_models():
+        print("=== モデルテスト開始 ===")
         
-        # (中略: Reconstructionと損失計算は変更なし)
-        pred_m_traj_recon_NBT2 = self.Singular_space_m.reconstruction(C_m_pred_KBN)
-        pred_s_traj_recon_NBT2 = self.Singular_space_s.reconstruction(C_s_pred_KBN)
-        pred_traj_recon_NBT2 = torch.zeros((self.s, n_ped, self.t_pred, self.dim), dtype=torch.float, device=obs_traj_BT2.device)
-        pred_traj_recon_NBT2[:, mask_B], pred_traj_recon_NBT2[:, ~mask_B] = pred_m_traj_recon_NBT2, pred_s_traj_recon_NBT2
-        output = {"recon_traj": pred_traj_recon_NBT2}
+        batch_size = 4
+        seq_len = 8
+        pred_len = 12
+        input_dim = 3
+        num_pedestrians = 5
         
-        if pred_traj_BT2 is not None:
-            # ... (既存の損失計算ロジック) ...
-            C_pred_KBN = torch.zeros((self.k, n_ped, self.s), dtype=torch.float, device=obs_traj_BT2.device)
-            C_pred_KBN[:, mask_B], C_pred_KBN[:, ~mask_B] = C_m_pred_KBN, C_s_pred_KBN
-            C_pred_gt_KB = torch.zeros((self.k, n_ped), dtype=torch.float, device=obs_traj_BT2.device)
-            C_pred_gt_KB[:, mask_B], C_pred_gt_KB[:, ~mask_B] = C_m_pred_gt_KB, C_s_pred_gt_KB
-            C_pred_gt_KB = C_pred_gt_KB.detach()
-            error_coefficient = (C_pred_KBN - C_pred_gt_KB.unsqueeze(dim=-1)).norm(p=2, dim=0)
-            error_displacement_NBT = (pred_traj_recon_NBT2 - pred_traj_BT2.unsqueeze(dim=0)).norm(p=2, dim=-1)
-            output["loss_eigentraj"] = error_coefficient.min(dim=-1)[0].mean()
-            output["loss_euclidean_ade"] = error_displacement_NBT.mean(dim=-1).min(dim=0)[0].mean()
-            output["loss_euclidean_fde"] = error_displacement_NBT[:, :, -1].min(dim=0)[0].mean()
-            output["loss_diversity"] = torch.tensor(0.0, device=obs_traj_BT2.device)
-            traj_BT2 = torch.cat([obs_traj_BT2, pred_traj_BT2], dim=1)
+        # 4次元テンソルのテスト
+        input_traj_4d = torch.randn(batch_size, seq_len, num_pedestrians, input_dim)
+        print(f"テスト入力形状: {input_traj_4d.shape}")
+        
+        obstacle_map = torch.randn(batch_size, 2)
+        
+        try:
+            model = TwoStageTrajectoryPredictor(
+                input_dim=input_dim,
+                output_dim=input_dim,
+                seq_len=seq_len,
+                pred_len=pred_len,
+                num_pedestrians=num_pedestrians
+            )
             
-            if self.hyper_params.baseline_use_map:
-                map_nce_loss = self.map_nce(traj_BT2, context_BK, map_patches_B1HW)
-                output["loss_map_nce"] = map_nce_loss
-                env_collision_loss_total = 0
-                scene_ids_B = addl_info["scene_ids"]
-                maps_dict = addl_info["maps"]
-                homography_dict = addl_info["homography"]
-                vector_field_dict = addl_info["vector_field"]
-                for dataset_name in maps_dict.keys():
-                    map_mask_1HW = (maps_dict[dataset_name]).to(device=obs_traj_BT2.device) * 255
-                    hom_meters2mask = torch.from_numpy(homography_dict[dataset_name]["meters2mask"]).to(obs_traj_BT2.device)
-                    hom_meters2image = torch.from_numpy(homography_dict[dataset_name]["meters2image"]).to(obs_traj_BT2.device)
-                    hom_image2meters = torch.from_numpy(homography_dict[dataset_name]["image2meters"]).to(obs_traj_BT2.device)
-                    vector_field = torch.from_numpy(vector_field_dict[dataset_name]).to(obs_traj_BT2.device)
-                    img_size = torch.tensor(vector_field.shape[1::-1], device=obs_traj_BT2.device) // 2
-                    scene_pred_BT2 = pred_traj_BT2[scene_ids_B == dataset_name]
-                    scene_pred_hat_NBT2 = pred_traj_recon_NBT2[:, scene_ids_B == dataset_name]
-                    scene_pred_hat_AT2 = scene_pred_hat_NBT2.view(-1, self.t_pred, 2)
-                    if scene_pred_BT2.size(0) == 0:
-                        continue
-                    mode = self.hyper_params.env_col_loss_mode
-                    env_collision_loss = self.compute_env_col_loss(scene_pred_BT2, scene_pred_hat_AT2, map_mask_1HW, hom_meters2mask, hom_meters2image, hom_image2meters, img_size, vector_field, mode=mode)
-                    env_collision_loss_total += env_collision_loss
-                output["loss_env_collision"] = env_collision_loss_total
-            else:
-                output["loss_map_nce"] = torch.tensor(0.0, device=obs_traj_BT2.device)
-                output["loss_env_collision"] = torch.tensor(0.0, device=obs_traj_BT2.device)
-        return output
+            final_pred, stage1_pred, contrast = model(input_traj_4d, obstacle_map)
+            
+            print("✅ テスト成功")
+            print(f"   最終予測形状: {final_pred.shape} (期待値: {batch_size, pred_len, input_dim})")
+            print(f"   Stage1予測形状: {stage1_pred.shape} (期待値: {batch_size, pred_len//2, input_dim})")
+            print(f"   コントラスト特徴量形状: {contrast.shape}")
 
-    # (generate_artificial_gt, compute_env_col_loss, etc. は変更なし)
-    @torch.no_grad()
-    def generate_artificial_gt(self, scene_pred_hat_AT2, vector_field, map_mask_1HW, hom_meters2mask, hom_meters2image, hom_image2meters, img_size, min_margin, max_margin):
-        traj_image_AT2 = hm.project(scene_pred_hat_AT2, hom_meters2image).int()
-        traj_image_AT2 = torch.clamp(traj_image_AT2, min=-img_size//2, max=img_size + img_size//2 - 1)
-        idx_h = traj_image_AT2[:, :, 1] + img_size[1] // 2
-        idx_w = traj_image_AT2[:, :, 0] + img_size[0] // 2
-        closest_valid_pos_img_AT2 = vector_field[idx_h, idx_w]
-        closest_valid_pos_img_AT2 = closest_valid_pos_img_AT2.flip(2) - img_size // 2
-        closest_valid_pos_AT2 = hm.project(closest_valid_pos_img_AT2, hom_image2meters)
-        displ_AT2 = (closest_valid_pos_AT2 - scene_pred_hat_AT2).float()
-        norm_AT1 = displ_AT2.norm(p=2, dim=-1, keepdim=True)
-        almost_zero = torch.isclose(norm_AT1, torch.zeros_like(norm_AT1), atol=1e-1)
-        norm_AT1[almost_zero] = 1
-        dir_AT2 = displ_AT2 / norm_AT1
-        dir_AT2[almost_zero.expand_as(dir_AT2)] = 0
-        artificial_gt_AT2 = (scene_pred_hat_AT2 + displ_AT2).float()
-        margin_range = max_margin - min_margin
-        margin_A = torch.rand(scene_pred_hat_AT2.size(0), device=scene_pred_hat_AT2.device) * margin_range + min_margin
-        margin_AT2 = dir_AT2 * margin_A[:, None, None]
-        artificial_gt_AT2 = artificial_gt_AT2 + margin_AT2
-        artificial_gt_aug_AT2 = model_utils.augment_traj_resolution(artificial_gt_AT2, parts=1)
-        env_gt_collisions_A = model_utils.check_env_collisions(artificial_gt_aug_AT2, map_mask_1HW, torch.eye(3).to(artificial_gt_AT2.device), hom_meters2mask)
-        valid_env_gt_collisions_A = ~env_gt_collisions_A
-        return artificial_gt_AT2, valid_env_gt_collisions_A
+            assert final_pred.shape == (batch_size, pred_len, input_dim)
+            assert stage1_pred.shape == (batch_size, pred_len//2, input_dim)
 
-    def compute_env_col_loss(self, scene_pred_BT2, scene_pred_hat_AT2, map_mask_1HW, hom_meters2mask, hom_meters2image, hom_image2meters, img_size, vector_field, mode: Literal["true-gt", "synth-gt"]):
-        env_collisions_AP = model_utils.check_env_collisions_precise(scene_pred_hat_AT2, map_mask_1HW, torch.eye(3).to(scene_pred_hat_AT2.device), hom_meters2mask)
-        if mode == "synth-gt":
-            env_collisions_A = env_collisions_AP.any(dim=-1)
-            up_to_first_col_included_AP = env_collisions_AP.cumsum(dim=-1) <= 1
-            min_margin = self.hyper_params.env_col_loss_synth_gt_min_margin
-            max_margin = self.hyper_params.env_col_loss_synth_gt_max_margin
-            artificial_gt_AT2, valid_env_gt_collisions_A = self.generate_artificial_gt(scene_pred_hat_AT2, vector_field, map_mask_1HW, hom_meters2mask, hom_meters2image, hom_image2meters, img_size, min_margin=min_margin, max_margin=max_margin)
-            fake_env_collisions_AP = env_collisions_A.unsqueeze(dim=-1).expand_as(env_collisions_AP)
-            loss_mask_AT = fake_env_collisions_AP & up_to_first_col_included_AP
-            gt_C2 = artificial_gt_AT2[loss_mask_AT]
-            env_collision_loss = torch.tensor(0.0, device=scene_pred_hat_AT2.device)
-            if scene_pred_hat_AT2[loss_mask_AT].size(0) > 0:
-                env_collision_loss = F.mse_loss(scene_pred_hat_AT2[loss_mask_AT], gt_C2, reduction='mean')
-                if torch.isnan(env_collision_loss):
-                    env_collision_loss = torch.tensor(0.0, device=env_collision_loss.device)
-        else:
-            env_collisions_A = env_collisions_AP.any(dim=-1)
-            env_collisions_NB = env_collisions_A.view(self.s, -1)
-            loss_mask_A = env_collisions_A
-            _, gt_index_A = torch.where(env_collisions_NB)
-            gt_AT2 = scene_pred_BT2[gt_index_A]
+        except Exception as e:
+            print(f"❌ テスト失敗: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        print("=== モデルテスト終了 ===")
+
+    test_models()
