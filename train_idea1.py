@@ -1,6 +1,6 @@
 """
 train_idea1.py (ベストモデル保存機能付き)
-各エポックで検証を行い、最も性能が良いモデルを保存する機能を追加。
+各エポックで検証を行い、最も性能が良いモデルを保存し、最終的にその性能を報告する。
 """
 
 import torch
@@ -92,7 +92,6 @@ def safe_train_step(model, optimizer, input_traj, target_traj, obstacle_map,
         logger.error(f"❌ 訓練ステップでエラー: {e}", exc_info=True)
         return create_zero_losses()
 
-# ### ★★★★★ 新しく追加 ★★★★★ ###
 def safe_eval_step(model, input_traj, target_traj, obstacle_map):
     """安全な検証ステップ（勾配計算なし）"""
     model.eval()
@@ -168,7 +167,6 @@ def main():
     
     logger.info("🎓 訓練開始")
     
-    # ### ★★★★★ 修正点 ★★★★★ ###
     best_val_ade = float('inf')
     best_epoch = 0
     
@@ -178,9 +176,8 @@ def main():
         # --- 訓練フェーズ ---
         epoch_losses, epoch_ades, epoch_fdes = [], [], []
         max_batches_per_epoch = 50
-        model.train() # 訓練モードに設定
+        model.train()
         for batch_idx in range(max_batches_per_epoch):
-            # (データ読み込み部分は変更なし)
             if use_dataloader:
                 batch_data = process_dataloader_batch(train_dataloader, config['pred_len'])
                 if batch_data is None:
@@ -203,9 +200,8 @@ def main():
         # --- 検証フェーズ ---
         val_epoch_ades, val_epoch_fdes = [], []
         max_val_batches = 10
-        model.eval() # 検証モードに設定
+        model.eval()
         for _ in range(max_val_batches):
-            # (検証データもダミーで代用)
             input_traj, target_traj, obstacle_map = create_dummy_data(**config)
             input_traj, target_traj, obstacle_map = input_traj.to(device), target_traj.to(device), obstacle_map.to(device)
             
@@ -231,7 +227,36 @@ def main():
     logger.info("🎉 訓練完了")
     torch.save(model.state_dict(), 'last_model_social.pth')
     logger.info(f"✅ 最終モデル保存完了: last_model_social.pth")
-    logger.info(f"🏆 ベストモデルは Epoch {best_epoch} の ADE: {best_val_ade:.4f} でした。 (best_model_social.pth)")
+    
+    # ### ★★★★★ 修正点 ★★★★★ ###
+    # 最終的なベストモデルの性能を表示
+    if os.path.exists('best_model_social.pth'):
+        logger.info("\n" + "="*60)
+        logger.info("🏆 ベストモデルの最終評価 🏆")
+        logger.info(f"   (Epoch {best_epoch} で達成)")
+        
+        # ベストモデルの重みをロード
+        model.load_state_dict(torch.load('best_model_social.pth'))
+        
+        # 再度、検証データで評価
+        final_eval_ades, final_eval_fdes = [], []
+        max_eval_batches = 50 # より多くのバッチで評価
+        model.eval()
+        for _ in range(max_eval_batches):
+            input_traj, target_traj, obstacle_map = create_dummy_data(**config)
+            input_traj, target_traj, obstacle_map = input_traj.to(device), target_traj.to(device), obstacle_map.to(device)
+            metrics = safe_eval_step(model, input_traj, target_traj, obstacle_map)
+            final_eval_ades.append(metrics['ade'])
+            final_eval_fdes.append(metrics['fde'])
+            
+        final_ade = np.mean(final_eval_ades)
+        final_fde = np.mean(final_eval_fdes)
+        
+        logger.info(f"   >> 最終ADE: {final_ade:.4f}")
+        logger.info(f"   >> 最終FDE: {final_fde:.4f}")
+        logger.info("="*60)
+    else:
+        logger.warning("ベストモデルファイル 'best_model_social.pth' が見つかりませんでした。")
 
 if __name__ == "__main__":
     main()
