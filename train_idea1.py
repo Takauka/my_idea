@@ -138,7 +138,7 @@ def main():
         'seq_len': 8, 
         'pred_len': 12, 
         'num_pedestrians': 5,
-        'hidden_dim': 96, # ### ★★★★★ 修正点 ★★★★★ ### モデルの表現力を少し向上
+        'hidden_dim': 128, # 96から128に増やす
         'num_epochs': 500, 
         'learning_rate': 0.0005,
         'weight_decay': 1e-5, 
@@ -173,7 +173,7 @@ def main():
     
     # ### ★★★★★ 修正点 ★★★★★ ###
     # スコアが停滞したら学習率を下げる、より賢いスケジューラに変更
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, verbose=True)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
     
     logger.info("🎓 訓練開始")
     
