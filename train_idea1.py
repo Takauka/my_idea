@@ -56,12 +56,11 @@ def process_batch(x_batch, y_batch, target_ids_batch, obs_len, pred_len, num_ped
         pred_traj_seq = y_batch[i] # これもフレーム(numpy配列)のリストです
         target_id = target_ids_batch[i]
 
-        # --- FIX: AttributeErrorを解消し、正しく歩行者IDを収集 ---
         all_peds_in_seq = set()
         for frame in obs_traj_seq:
-            if frame.size > 0:  # フレームが空でないことを確認
-                # 標準的なデータ形式 [フレームID, 歩行者ID, X, Y] を想定
-                all_peds_in_seq.update(np.unique(frame[:, 1]))
+            if frame.size > 0:
+                # --- FIX: データ形式を [ped_id, x, y] と想定し、0列目からIDを取得 ---
+                all_peds_in_seq.update(np.unique(frame[:, 0]))
         
         # ターゲットを先頭にした歩行者リストを作成
         other_peds = sorted(list(all_peds_in_seq - {target_id}))
@@ -72,13 +71,12 @@ def process_batch(x_batch, y_batch, target_ids_batch, obs_len, pred_len, num_ped
         
         ped_to_idx = {ped_id: idx for idx, ped_id in enumerate(ordered_peds)}
         
-        # --- FIX: データを正しいインデックスからテンソルに格納 ---
         for t in range(obs_len):
             frame_data_array = obs_traj_seq[t]
             for row in frame_data_array:
-                # [フレームID, 歩行者ID, X, Y]
-                ped_id = row[1]
-                x, y = row[2], row[3]
+                # --- FIX: [ped_id, x, y] のインデックスに合わせてデータを抽出 ---
+                ped_id = row[0]
+                x, y = row[1], row[2]
                 if ped_id in ped_to_idx:
                     idx = ped_to_idx[ped_id]
                     input_tensor[i, t, idx, :] = torch.tensor([x, y])
@@ -86,9 +84,9 @@ def process_batch(x_batch, y_batch, target_ids_batch, obs_len, pred_len, num_ped
         for t in range(pred_len):
             frame_data_array = pred_traj_seq[t]
             for row in frame_data_array:
-                # [フレームID, 歩行者ID, X, Y]
-                ped_id = row[1]
-                x, y = row[2], row[3]
+                # --- FIX: [ped_id, x, y] のインデックスに合わせてデータを抽出 ---
+                ped_id = row[0]
+                x, y = row[1], row[2]
                 if ped_id in ped_to_idx:
                     idx = ped_to_idx[ped_id]
                     target_tensor[i, t, idx, :] = torch.tensor([x, y])
