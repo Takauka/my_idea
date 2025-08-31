@@ -155,9 +155,9 @@ def main():
     # --- 1. データローダーの準備 ---
     try:
         seq_len = args.obs_len + args.pred_len
-        # --- MODIFIED: DataLoaderの呼び出しを簡素化。num_of_validation=0で全データを訓練に使用 ---
+        # --- FIX: DataLoaderの呼び出しを修正。validation_size=0で全データを訓練に使用 ---
         dataloader = DataLoader(args.data_dir, args.batch_size, seq_len, 
-                                num_of_validation=0,
+                                validation_size=0,
                                 forcePreProcess=True)
     except FileNotFoundError as e:
         logger.error(e)
