@@ -172,3 +172,94 @@ class DataLoader():
             counter = sum(len(frame_list) - self.seq_length + 1 for frame_list in self.data if frame_list)
             self.num_batches = int(counter / self.batch_size)
 
+
+    def next_batch(self):
+        '''次の訓練バッチを取得'''
+        return self._get_batch_from_pointer(valid=False)
+
+    def next_valid_batch(self):
+        '''次の検証バッチを取得'''
+        return self._get_batch_from_pointer(valid=True)
+
+    def _get_batch_from_pointer(self, valid=False):
+        '''ポインタからバッチデータを取得する共通ロジック'''
+        x_batch, y_batch, d, numPedsList_batch, PedsList_batch, target_ids_batch = [], [], [], [], [], []
+        
+        data_source = self.valid_data if valid else self.data
+        peds_list_source = self.valid_pedsList if valid else self.pedsList
+        num_peds_source = self.valid_numPedsList if valid else self.numPedsList
+        
+        pointer = self.valid_dataset_pointer if valid else self.dataset_pointer
+        frame_pointer = self.valid_frame_pointer if valid else self.frame_pointer
+
+        for _ in range(self.batch_size):
+            if pointer >= len(data_source) or frame_pointer + self.seq_length >= len(data_source[pointer]):
+                self._tick_batch_pointer(valid)
+                pointer = self.valid_dataset_pointer if valid else self.dataset_pointer
+                frame_pointer = self.valid_frame_pointer if valid else self.frame_pointer
+                
+                # ループを一周した場合、このバッチの充填を停止
+                if _ > 0 and pointer == 0 and frame_pointer == 0:
+                    break
+                # 最初の試行で失敗した場合、空のバッチループを避けるために抜ける
+                if _ == 0:
+                    return [], [], [], [], [], []
+                continue
+
+            # シーケンスデータを取得
+            x_seq = data_source[pointer][frame_pointer : frame_pointer + self.seq_length]
+            y_seq = data_source[pointer][frame_pointer + 1 : frame_pointer + self.seq_length + 1]
+            peds_list_seq = peds_list_source[pointer][frame_pointer : frame_pointer + self.seq_length]
+            num_peds_seq = num_peds_source[pointer][frame_pointer : frame_pointer + self.seq_length]
+            
+            # ターゲットIDを選択 (シーケンス内の最初のフレームにいる歩行者からランダムに選択)
+            possible_targets = [ped_id for ped_id in peds_list_seq[0]]
+            target_id = random.choice(possible_targets) if possible_targets else 0
+
+            x_batch.append(x_seq)
+            y_batch.append(y_seq)
+            d.append(pointer)
+            numPedsList_batch.append(num_peds_seq)
+            PedsList_batch.append(peds_list_seq)
+            target_ids_batch.append(target_id)
+            
+            # フレームポインタを進める
+            if valid: self.valid_frame_pointer += 1
+            else: self.frame_pointer += 1
+
+        return x_batch, y_batch, d, numPedsList_batch, PedsList_batch, target_ids_batch
+
+    def _tick_batch_pointer(self, valid=False):
+        '''データセットポインタとフレームポインタを更新'''
+        if valid:
+            self.valid_dataset_pointer += 1
+            if self.valid_dataset_pointer >= len(self.valid_data):
+                self.valid_dataset_pointer = 0
+            self.valid_frame_pointer = 0
+        else:
+            self.dataset_pointer += 1
+            if self.dataset_pointer >= len(self.data):
+                self.dataset_pointer = 0
+            self.frame_pointer = 0
+            
+    def reset_batch_pointer(self, valid=False):
+        '''ポインタをリセット'''
+        if valid:
+            self.valid_dataset_pointer = 0
+            self.valid_frame_pointer = 0
+        else:
+            self.dataset_pointer = 0
+            self.frame_pointer = 0
+    
+    def get_dataset_path(self, base_path, f_prefix):
+        '''指定されたパス内の.txtファイルを取得'''
+        dataset = []
+        full_path = os.path.join(f_prefix, base_path)
+        
+        if os.path.exists(full_path):
+            for root, _, files in os.walk(full_path):
+                for file in files:
+                    if file.endswith('.txt'):
+                        dataset.append(os.path.join(root, file))
+        return dataset
+
