@@ -52,14 +52,16 @@ def process_batch(x_batch, y_batch, target_ids_batch, obs_len, pred_len, num_ped
     target_tensor = torch.zeros(batch_size, pred_len, num_peds_fixed, 2)
 
     for i in range(batch_size):
-        obs_traj_seq = x_batch[i]
-        pred_traj_seq = y_batch[i]
+        obs_traj_seq = x_batch[i]  # これはフレーム(numpy配列)のリストです
+        pred_traj_seq = y_batch[i] # これもフレーム(numpy配列)のリストです
         target_id = target_ids_batch[i]
 
-        # シーケンス内の全歩行者IDを収集
+        # --- FIX: AttributeErrorを解消し、正しく歩行者IDを収集 ---
         all_peds_in_seq = set()
-        if obs_traj_seq.ndim >= 3 and obs_traj_seq.shape[2] > 1:
-            all_peds_in_seq.update(np.unique(obs_traj_seq[:, :, 1]))
+        for frame in obs_traj_seq:
+            if frame.size > 0:  # フレームが空でないことを確認
+                # 標準的なデータ形式 [フレームID, 歩行者ID, X, Y] を想定
+                all_peds_in_seq.update(np.unique(frame[:, 1]))
         
         # ターゲットを先頭にした歩行者リストを作成
         other_peds = sorted(list(all_peds_in_seq - {target_id}))
@@ -70,22 +72,26 @@ def process_batch(x_batch, y_batch, target_ids_batch, obs_len, pred_len, num_ped
         
         ped_to_idx = {ped_id: idx for idx, ped_id in enumerate(ordered_peds)}
         
-        # テンソルにデータを格納
+        # --- FIX: データを正しいインデックスからテンソルに格納 ---
         for t in range(obs_len):
-            for frame_data in obs_traj_seq[t]:
-                if len(frame_data) >= 4:
-                    x, y, ped_id = frame_data[1:4] # frame, x, y, ped_id
-                    if ped_id in ped_to_idx:
-                        idx = ped_to_idx[ped_id]
-                        input_tensor[i, t, idx, :] = torch.tensor([x, y])
+            frame_data_array = obs_traj_seq[t]
+            for row in frame_data_array:
+                # [フレームID, 歩行者ID, X, Y]
+                ped_id = row[1]
+                x, y = row[2], row[3]
+                if ped_id in ped_to_idx:
+                    idx = ped_to_idx[ped_id]
+                    input_tensor[i, t, idx, :] = torch.tensor([x, y])
                         
         for t in range(pred_len):
-            for frame_data in pred_traj_seq[t]:
-                if len(frame_data) >= 4:
-                    x, y, ped_id = frame_data[1:4]
-                    if ped_id in ped_to_idx:
-                        idx = ped_to_idx[ped_id]
-                        target_tensor[i, t, idx, :] = torch.tensor([x, y])
+            frame_data_array = pred_traj_seq[t]
+            for row in frame_data_array:
+                # [フレームID, 歩行者ID, X, Y]
+                ped_id = row[1]
+                x, y = row[2], row[3]
+                if ped_id in ped_to_idx:
+                    idx = ped_to_idx[ped_id]
+                    target_tensor[i, t, idx, :] = torch.tensor([x, y])
 
     return input_tensor, target_tensor
 
