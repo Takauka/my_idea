@@ -141,12 +141,15 @@ def main():
     parser.add_argument('--pred_len', type=int, default=12, help='予測長')
     # 訓練関連
     parser.add_argument('--batch_size', type=int, default=16, help='ミニバッチサイズ')
-    parser.add_argument('--num_epochs', type=int, default=500, help='エポック数')
+    # --- FIX: --num_epochs 引数を削除 ---
     parser.add_argument('--learning_rate', type=float, default=0.001, help='学習率')
     parser.add_argument('--weight_decay', type=float, default=1e-4, help='重み減衰')
     # その他
     parser.add_argument('--use_cuda', action="store_true", default=True, help='GPUを使用するか')
     args = parser.parse_args()
+    
+    # --- FIX: エポック数を500に直接設定 ---
+    num_epochs = 500
     
     logger.info("🚀 新しい二段階モデルの訓練を開始します (訓練特化モード)")
     device = torch.device("cuda" if args.use_cuda and torch.cuda.is_available() else "cpu")
@@ -181,8 +184,8 @@ def main():
     # --- 3. 訓練ループ ---
     logger.info("🎓 訓練開始")
     
-    for epoch in range(args.num_epochs):
-        logger.info(f"--- Epoch {epoch+1}/{args.num_epochs} ---")
+    for epoch in range(num_epochs):
+        logger.info(f"--- Epoch {epoch+1}/{num_epochs} ---")
         
         # --- 訓練 ---
         model.train()
