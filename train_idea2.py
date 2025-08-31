@@ -1,7 +1,7 @@
 """
-train_idea2.py (my_ideaモデル対応・最終版)
+train_idea2.py (my_ideaモデル対応・訓練特化版)
 新しい二段階予測モデル(TwoStageTrajectoryPredictor)を訓練します。
-utils.pyのデータ分割機能と連携するように最適化済み。
+このスクリプトは検証を行わず、訓練のみに専念します。
 """
 
 import torch
@@ -14,6 +14,7 @@ import os
 import time
 import pickle
 import argparse
+import math
 
 # -----------------------------------------------------------------------------
 # 必要なモジュールをインポート
@@ -121,39 +122,14 @@ def safe_train_step(model, optimizer, input_traj, target_traj):
         logger.error(f"❌ 訓練ステップでエラー: {e}", exc_info=True)
         return {'total_loss': 0.0, 'ade': float('inf'), 'fde': float('inf')}
 
-
-def safe_eval_step(model, input_traj, target_traj):
-    """安全な検証ステップ"""
-    model.eval()
-    with torch.no_grad():
-        try:
-            final_pred_target, _, _ = model(input_traj)
-            target_traj_target = target_traj[:, :, 0, :]
-            mask = (target_traj_target.abs().sum(dim=-1) > 0)
-            
-            if not mask.any(): return {'ade': 0.0, 'fde': 0.0}
-            
-            errors = torch.norm(final_pred_target - target_traj_target, dim=-1)
-            errors[~mask] = 0
-            
-            ade = (errors.sum() / mask.sum()).item()
-            fde = (errors[:, -1].sum() / mask[:, -1].sum()).item()
-            
-            return {'ade': ade, 'fde': fde}
-        except Exception as e:
-            logger.error(f"❌ 検証ステップでエラー: {e}", exc_info=True)
-            return {'ade': float('inf'), 'fde': float('inf')}
-
-
 # -----------------------------------------------------------------------------
 # メイン処理
 # -----------------------------------------------------------------------------
 def main():
     """メイン関数"""
     parser = argparse.ArgumentParser()
-    # --- NEW: データセットの場所を指定する引数を追加 ---
-    parser.add_argument('--data_dir', type=str, default='./data', help='データセットが格納されているルートディレクトリ')
-    parser.add_argument('--test_dataset', type=str, default='zara2', help='テスト用に除外するデータセット名 (例: eth, hotel, zara1, zara2, univ)')
+    # --- MODIFIED: 検証関連の引数を削除 ---
+    parser.add_argument('--data_dir', type=str, default='./data/train', help='訓練データセットが格納されているディレクトリ')
     
     # モデルのハイパーパラメータ
     parser.add_argument('--hidden_dim', type=int, default=64, help='RNN/GNNの隠れ層の次元')
@@ -168,22 +144,20 @@ def main():
     parser.add_argument('--num_epochs', type=int, default=500, help='エポック数')
     parser.add_argument('--learning_rate', type=float, default=0.001, help='学習率')
     parser.add_argument('--weight_decay', type=float, default=1e-4, help='重み減衰')
-    parser.add_argument('--validation_size', type=float, default=0.2, help='全データセットに対する検証データセットの割合')
     # その他
     parser.add_argument('--use_cuda', action="store_true", default=True, help='GPUを使用するか')
     args = parser.parse_args()
     
-    logger.info("🚀 新しい二段階モデルの訓練を開始します")
+    logger.info("🚀 新しい二段階モデルの訓練を開始します (訓練特化モード)")
     device = torch.device("cuda" if args.use_cuda and torch.cuda.is_available() else "cpu")
     logger.info(f"使用デバイス: {device}")
     
     # --- 1. データローダーの準備 ---
     try:
         seq_len = args.obs_len + args.pred_len
-        # --- FIX: forcePreProcessをTrueに設定し、キャッシュを強制的に再生成 ---
+        # --- MODIFIED: DataLoaderの呼び出しを簡素化。num_of_validation=0で全データを訓練に使用 ---
         dataloader = DataLoader(args.data_dir, args.batch_size, seq_len, 
-                                validation_size=args.validation_size,
-                                test_dataset_name=args.test_dataset,
+                                num_of_validation=0,
                                 forcePreProcess=True)
     except FileNotFoundError as e:
         logger.error(e)
@@ -206,7 +180,6 @@ def main():
 
     # --- 3. 訓練ループ ---
     logger.info("🎓 訓練開始")
-    best_val_ade = float('inf')
     
     for epoch in range(args.num_epochs):
         logger.info(f"--- Epoch {epoch+1}/{args.num_epochs} ---")
@@ -217,7 +190,7 @@ def main():
         dataloader.reset_batch_pointer()
         for _ in range(dataloader.num_batches):
             x, y, _, _, _, target_ids = dataloader.next_batch()
-            if not x: continue # バッチが空ならスキップ
+            if not x: continue
             input_traj, target_traj = process_batch(x, y, target_ids, args.obs_len, args.pred_len, args.num_pedestrians)
             input_traj, target_traj = input_traj.to(device), target_traj.to(device)
             
@@ -226,38 +199,19 @@ def main():
             epoch_ades.append(metrics['ade'])
             epoch_fdes.append(metrics['fde'])
         
-        logger.info(f" [訓練] Loss: {np.mean(epoch_losses):.4f}, ADE: {np.mean(epoch_ades):.4f}, FDE: {np.mean(epoch_fdes):.4f}")
+        avg_loss = np.mean(epoch_losses) if epoch_losses else 0
+        avg_ade = np.mean(epoch_ades) if epoch_ades else 0
+        avg_fde = np.mean(epoch_fdes) if epoch_fdes else 0
 
-        # --- 検証 ---
-        model.eval()
-        val_ades, val_fdes = [], []
-        
-        if dataloader.valid_num_batches > 0:
-            dataloader.reset_batch_pointer(valid=True)
-            for _ in range(dataloader.valid_num_batches):
-                x, y, _, _, _, target_ids = datalo.next_valid_batch()
-                if not x: continue # バッチが空ならスキップ
-                input_traj, target_traj = process_batch(x, y, target_ids, args.obs_len, args.pred_len, args.num_pedestrians)
-                input_traj, target_traj = input_traj.to(device), target_traj.to(device)
-                
-                metrics = safe_eval_step(model, input_traj, target_traj)
-                val_ades.append(metrics['ade'])
-                val_fdes.append(metrics['fde'])
-        else:
-             logger.warning(" [検証] 検証バッチが0のため、このエポックの検証はスキップします。")
+        logger.info(f" [訓練] Loss: {avg_loss:.4f}, ADE: {avg_ade:.4f}, FDE: {avg_fde:.4f}")
 
-        avg_val_ade = np.mean(val_ades) if val_ades else float('inf')
-        avg_val_fde = np.mean(val_fdes) if val_fdes else float('inf')
-        logger.info(f" [検証] ADE: {avg_val_ade:.4f}, FDE: {avg_val_fde:.4f}")
-        
-        if avg_val_ade != float('inf'):
-            scheduler.step(avg_val_ade)
-            if avg_val_ade < best_val_ade:
-                best_val_ade = avg_val_ade
-                torch.save(model.state_dict(), os.path.join(save_directory, 'best_model_social.pth'))
-                logger.info(f"🎉 新しいベストモデルを保存しました！ (ADE: {best_val_ade:.4f})")
+        # --- MODIFIED: 検証ループを削除し、訓練ロスでスケジューラを更新 ---
+        scheduler.step(avg_loss)
 
-    logger.info("🎉 訓練完了")
+    # --- MODIFIED: 最終エポックのモデルを保存 ---
+    final_model_path = os.path.join(save_directory, 'trained_model.pth')
+    torch.save(model.state_dict(), final_model_path)
+    logger.info(f"🎉 訓練完了。最終モデルを '{final_model_path}' に保存しました。")
 
 if __name__ == "__main__":
     main()
