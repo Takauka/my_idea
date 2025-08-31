@@ -1,5 +1,5 @@
 """
-train_idea1.py (my_ideaモデル対応・最終版)
+train_idea2.py (my_ideaモデル対応・最終版)
 新しい二段階予測モデル(TwoStageTrajectoryPredictor)を訓練します。
 utils.pyのデータ分割機能と連携するように最適化済み。
 """
@@ -151,6 +151,10 @@ def safe_eval_step(model, input_traj, target_traj):
 def main():
     """メイン関数"""
     parser = argparse.ArgumentParser()
+    # --- NEW: データセットの場所を指定する引数を追加 ---
+    parser.add_argument('--data_dir', type=str, default='./data', help='データセットが格納されているルートディレクトリ')
+    parser.add_argument('--test_dataset', type=str, default='zara2', help='テスト用に除外するデータセット名 (例: eth, hotel, zara1, zara2, univ)')
+    
     # モデルのハイパーパラメータ
     parser.add_argument('--hidden_dim', type=int, default=64, help='RNN/GNNの隠れ層の次元')
     parser.add_argument('--num_layers', type=int, default=2, help='LSTMの層数')
@@ -176,9 +180,11 @@ def main():
     # --- 1. データローダーの準備 ---
     try:
         seq_len = args.obs_len + args.pred_len
-        dataloader = DataLoader('.', args.batch_size, seq_len, 
-                                validation_size=args.validation_size, 
-                                forcePreProcess=False)
+        # --- FIX: forcePreProcessをTrueに設定し、キャッシュを強制的に再生成 ---
+        dataloader = DataLoader(args.data_dir, args.batch_size, seq_len, 
+                                validation_size=args.validation_size,
+                                test_dataset_name=args.test_dataset,
+                                forcePreProcess=True)
     except FileNotFoundError as e:
         logger.error(e)
         logger.info("訓練を中止します。")
@@ -229,7 +235,7 @@ def main():
         if dataloader.valid_num_batches > 0:
             dataloader.reset_batch_pointer(valid=True)
             for _ in range(dataloader.valid_num_batches):
-                x, y, _, _, _, target_ids = dataloader.next_valid_batch()
+                x, y, _, _, _, target_ids = datalo.next_valid_batch()
                 if not x: continue # バッチが空ならスキップ
                 input_traj, target_traj = process_batch(x, y, target_ids, args.obs_len, args.pred_len, args.num_pedestrians)
                 input_traj, target_traj = input_traj.to(device), target_traj.to(device)
@@ -238,9 +244,7 @@ def main():
                 val_ades.append(metrics['ade'])
                 val_fdes.append(metrics['fde'])
         else:
-            # --- FIX: インデントを修正 ---
-            logger.warning(" [検証] 検証バッチが0のため、このエポックの検証はスキップします。")
-
+             logger.warning(" [検証] 検証バッチが0のため、このエポックの検証はスキップします。")
 
         avg_val_ade = np.mean(val_ades) if val_ades else float('inf')
         avg_val_fde = np.mean(val_fdes) if val_fdes else float('inf')
@@ -257,3 +261,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
