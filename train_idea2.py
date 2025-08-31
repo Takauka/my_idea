@@ -238,7 +238,8 @@ def main():
                 val_ades.append(metrics['ade'])
                 val_fdes.append(metrics['fde'])
         else:
-             logger.warning(" [検証] 検証バッチが0のため、このエポックの検証はスキップします。")
+            # --- FIX: インデントを修正 ---
+            logger.warning(" [検証] 検証バッチが0のため、このエポックの検証はスキップします。")
 
 
         avg_val_ade = np.mean(val_ades) if val_ades else float('inf')
@@ -251,48 +252,6 @@ def main():
                 best_val_ade = avg_val_ade
                 torch.save(model.state_dict(), os.path.join(save_directory, 'best_model_social.pth'))
                 logger.info(f"🎉 新しいベストモデルを保存しました！ (ADE: {best_val_ade:.4f})")
-
-    logger.info("🎉 訓練完了")
-
-if __name__ == "__main__":
-    main()
-        
-        # --- FIX: 検証データセットの有無で処理を分岐 ---
-        has_validation_data = dataloader.valid_num_batches > 0
-
-        if has_validation_data:
-            logger.info(" [検証] 専用の検証データで評価します。")
-            dataloader.reset_batch_pointer(valid=True)
-            for _ in range(dataloader.valid_num_batches):
-                x, y, _, _, _, target_ids = dataloader.next_valid_batch()
-                input_traj, target_traj = process_batch(x, y, target_ids, args.obs_len, args.pred_len, args.num_pedestrians)
-                input_traj, target_traj = input_traj.to(device), target_traj.to(device)
-                
-                metrics = safe_eval_step(model, input_traj, target_traj)
-                val_ades.append(metrics['ade'])
-                val_fdes.append(metrics['fde'])
-        else:
-            logger.warning(" [検証] 専用の検証データが見つかりません。訓練データで評価します。")
-            dataloader.reset_batch_pointer(valid=False) # 訓練データポインタをリセット
-            for _ in range(dataloader.num_batches):
-                x, y, _, _, _, target_ids = dataloader.next_batch()
-                input_traj, target_traj = process_batch(x, y, target_ids, args.obs_len, args.pred_len, args.num_pedestrians)
-                input_traj, target_traj = input_traj.to(device), target_traj.to(device)
-                
-                metrics = safe_eval_step(model, input_traj, target_traj)
-                val_ades.append(metrics['ade'])
-                val_fdes.append(metrics['fde'])
-
-        avg_val_ade = np.mean(val_ades) if val_ades else float('inf')
-        avg_val_fde = np.mean(val_fdes) if val_fdes else float('inf')
-        logger.info(f" [検証] ADE: {avg_val_ade:.4f}, FDE: {avg_val_fde:.4f}")
-        
-        scheduler.step(avg_val_ade)
-        
-        if avg_val_ade < best_val_ade:
-            best_val_ade = avg_val_ade
-            torch.save(model.state_dict(), os.path.join(save_directory, 'best_model_social.pth'))
-            logger.info(f"🎉 新しいベストモデルを保存しました！ (ADE: {best_val_ade:.4f})")
 
     logger.info("🎉 訓練完了")
 
