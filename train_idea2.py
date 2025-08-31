@@ -1,7 +1,7 @@
 """
-train_idea1.py (my_ideaモデル対応・修正版)
+train_idea1.py (my_ideaモデル対応・最終版)
 新しい二段階予測モデル(TwoStageTrajectoryPredictor)を訓練します。
-モデルの出力形式に合わせてデータ処理と損失計算を最適化。
+utils.pyのデータ分割機能と連携するように最適化済み。
 """
 
 import torch
@@ -14,7 +14,6 @@ import os
 import time
 import pickle
 import argparse
-import math
 
 # -----------------------------------------------------------------------------
 # 必要なモジュールをインポート
@@ -38,7 +37,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # -----------------------------------------------------------------------------
-# データ処理と訓練・評価ステップ
+# データ処理と訓練・評価ステップ (変更なし)
 # -----------------------------------------------------------------------------
 def process_batch(x_batch, y_batch, target_ids_batch, obs_len, pred_len, num_peds_fixed):
     """
@@ -47,50 +46,37 @@ def process_batch(x_batch, y_batch, target_ids_batch, obs_len, pred_len, num_ped
     """
     batch_size = len(x_batch)
     
-    # モデル入力用のテンソルを初期化
-    # (batch, seq, peds, feats)
     input_tensor = torch.zeros(batch_size, obs_len, num_peds_fixed, 2)
     target_tensor = torch.zeros(batch_size, pred_len, num_peds_fixed, 2)
 
     for i in range(batch_size):
-        obs_traj_seq = x_batch[i]  # これはフレーム(numpy配列)のリストです
-        pred_traj_seq = y_batch[i] # これもフレーム(numpy配列)のリストです
+        obs_traj_seq = x_batch[i]
+        pred_traj_seq = y_batch[i]
         target_id = target_ids_batch[i]
 
         all_peds_in_seq = set()
         for frame in obs_traj_seq:
             if frame.size > 0:
-                # --- FIX: データ形式を [ped_id, x, y] と想定し、0列目からIDを取得 ---
                 all_peds_in_seq.update(np.unique(frame[:, 0]))
         
-        # ターゲットを先頭にした歩行者リストを作成
         other_peds = sorted(list(all_peds_in_seq - {target_id}))
-        ordered_peds = [target_id] + other_peds
-        
-        # 固定長に切り詰め
-        ordered_peds = ordered_peds[:num_peds_fixed]
+        ordered_peds = ([target_id] + other_peds)[:num_peds_fixed]
         
         ped_to_idx = {ped_id: idx for idx, ped_id in enumerate(ordered_peds)}
         
         for t in range(obs_len):
             frame_data_array = obs_traj_seq[t]
             for row in frame_data_array:
-                # --- FIX: [ped_id, x, y] のインデックスに合わせてデータを抽出 ---
-                ped_id = row[0]
-                x, y = row[1], row[2]
+                ped_id, x, y = row[0], row[1], row[2]
                 if ped_id in ped_to_idx:
-                    idx = ped_to_idx[ped_id]
-                    input_tensor[i, t, idx, :] = torch.tensor([x, y])
+                    input_tensor[i, t, ped_to_idx[ped_id], :] = torch.tensor([x, y])
                         
         for t in range(pred_len):
             frame_data_array = pred_traj_seq[t]
             for row in frame_data_array:
-                # --- FIX: [ped_id, x, y] のインデックスに合わせてデータを抽出 ---
-                ped_id = row[0]
-                x, y = row[1], row[2]
+                ped_id, x, y = row[0], row[1], row[2]
                 if ped_id in ped_to_idx:
-                    idx = ped_to_idx[ped_id]
-                    target_tensor[i, t, idx, :] = torch.tensor([x, y])
+                    target_tensor[i, t, ped_to_idx[ped_id], :] = torch.tensor([x, y])
 
     return input_tensor, target_tensor
 
@@ -101,26 +87,17 @@ def safe_train_step(model, optimizer, input_traj, target_traj):
     optimizer.zero_grad()
     
     try:
-        # モデルはターゲット歩行者の予測のみを返す
         final_pred_target, stage1_pred_target, _ = model(input_traj)
-        
-        # 正解データもターゲット歩行者のもの（インデックス0）を抽出
         target_traj_target = target_traj[:, :, 0, :]
         
-        # 損失計算 (ターゲットが存在する箇所のみ)
-        # ターゲット歩行者がそのタイムステップに存在するかどうかのマスク
         mask = (target_traj_target.abs().sum(dim=-1) > 0)
-
         if not mask.any(): return {'total_loss': 0.0, 'ade': 0.0, 'fde': 0.0}
         
-        # メイン損失
         main_loss = F.mse_loss(final_pred_target[mask], target_traj_target[mask])
         
-        # Stage1の損失
         short_pred_len = stage1_pred_target.shape[1]
         stage1_target = target_traj_target[:, :short_pred_len, :]
         stage1_mask = mask[:, :short_pred_len]
-        
         stage1_loss = F.mse_loss(stage1_pred_target[stage1_mask], stage1_target[stage1_mask])
         
         total_loss = main_loss + 0.3 * stage1_loss
@@ -136,10 +113,10 @@ def safe_train_step(model, optimizer, input_traj, target_traj):
         with torch.no_grad():
             errors = torch.norm(final_pred_target - target_traj_target, dim=-1)
             errors[~mask] = 0
-            ade = errors.sum() / mask.sum()
-            fde = errors[:, -1].sum() / mask[:, -1].sum()
+            ade = (errors.sum() / mask.sum()).item()
+            fde = (errors[:, -1].sum() / mask[:, -1].sum()).item()
 
-        return {'total_loss': total_loss.item(), 'ade': ade.item(), 'fde': fde.item()}
+        return {'total_loss': total_loss.item(), 'ade': ade, 'fde': fde}
     except Exception as e:
         logger.error(f"❌ 訓練ステップでエラー: {e}", exc_info=True)
         return {'total_loss': 0.0, 'ade': float('inf'), 'fde': float('inf')}
@@ -159,10 +136,10 @@ def safe_eval_step(model, input_traj, target_traj):
             errors = torch.norm(final_pred_target - target_traj_target, dim=-1)
             errors[~mask] = 0
             
-            ade = errors.sum() / mask.sum()
-            fde = errors[:, -1].sum() / mask[:, -1].sum()
+            ade = (errors.sum() / mask.sum()).item()
+            fde = (errors[:, -1].sum() / mask[:, -1].sum()).item()
             
-            return {'ade': ade.item(), 'fde': fde.item()}
+            return {'ade': ade, 'fde': fde}
         except Exception as e:
             logger.error(f"❌ 検証ステップでエラー: {e}", exc_info=True)
             return {'ade': float('inf'), 'fde': float('inf')}
@@ -184,11 +161,9 @@ def main():
     parser.add_argument('--pred_len', type=int, default=12, help='予測長')
     # 訓練関連
     parser.add_argument('--batch_size', type=int, default=16, help='ミニバッチサイズ')
-    # --- FIX: エポック数を500に変更 ---
     parser.add_argument('--num_epochs', type=int, default=500, help='エポック数')
     parser.add_argument('--learning_rate', type=float, default=0.001, help='学習率')
     parser.add_argument('--weight_decay', type=float, default=1e-4, help='重み減衰')
-    # --- NEW: 検証データセットの割合を指定する引数を追加 ---
     parser.add_argument('--validation_size', type=float, default=0.2, help='全データセットに対する検証データセットの割合')
     # その他
     parser.add_argument('--use_cuda', action="store_true", default=True, help='GPUを使用するか')
@@ -199,35 +174,21 @@ def main():
     logger.info(f"使用デバイス: {device}")
     
     # --- 1. データローダーの準備 ---
-    train_data_dir = './data/train'
-    if not os.path.exists(train_data_dir) or not os.listdir(train_data_dir):
-        logger.error(f"❌ 訓練データが見つかりません。'{train_data_dir}' ディレクトリにデータファイルを配置してください。")
+    try:
+        seq_len = args.obs_len + args.pred_len
+        dataloader = DataLoader('.', args.batch_size, seq_len, 
+                                validation_size=args.validation_size, 
+                                forcePreProcess=False)
+    except FileNotFoundError as e:
+        logger.error(e)
         logger.info("訓練を中止します。")
         return
 
     save_directory = './model/TwoStagePredictor'
     if not os.path.exists(save_directory): os.makedirs(save_directory)
 
-    seq_len = args.obs_len + args.pred_len
-    
-    # --- NEW: データセットの総数を数え、検証セットの数を計算 ---
-    # forcePreProcess=Falseで一時的にロードし、データセット数を取得
-    temp_loader = DataLoader('.', 1, seq_len, 0, forcePreProcess=False)
-    num_total_datasets = temp_loader.num_datasets
-    num_validation_datasets = math.ceil(num_total_datasets * args.validation_size)
-    
-    if num_total_datasets == 0:
-        logger.error("❌ データセットファイルが1つも見つかりませんでした。")
-        return
-    
-    logger.info(f"📊 全{num_total_datasets}データセットのうち、{num_validation_datasets}個を検証用に使用します。")
-
-    # 計算した検証セット数で本番のDataLoaderを初期化
-    dataloader = DataLoader('.', args.batch_size, seq_len, num_of_validation=num_validation_datasets, forcePreProcess=True)
-    
     # --- 2. モデル、最適化手法、スケジューラの定義 ---
     model = TwoStageTrajectoryPredictor(
-        # モデル定義は3次元(x, y, ?)だが、データは2次元(x, y)なので合わせる
         input_dim=2, output_dim=2, 
         hidden_dim=args.hidden_dim, seq_len=args.obs_len,
         pred_len=args.pred_len, num_layers=args.num_layers, dropout=args.dropout,
@@ -250,6 +211,7 @@ def main():
         dataloader.reset_batch_pointer()
         for _ in range(dataloader.num_batches):
             x, y, _, _, _, target_ids = dataloader.next_batch()
+            if not x: continue # バッチが空ならスキップ
             input_traj, target_traj = process_batch(x, y, target_ids, args.obs_len, args.pred_len, args.num_pedestrians)
             input_traj, target_traj = input_traj.to(device), target_traj.to(device)
             
@@ -263,6 +225,37 @@ def main():
         # --- 検証 ---
         model.eval()
         val_ades, val_fdes = [], []
+        
+        if dataloader.valid_num_batches > 0:
+            dataloader.reset_batch_pointer(valid=True)
+            for _ in range(dataloader.valid_num_batches):
+                x, y, _, _, _, target_ids = dataloader.next_valid_batch()
+                if not x: continue # バッチが空ならスキップ
+                input_traj, target_traj = process_batch(x, y, target_ids, args.obs_len, args.pred_len, args.num_pedestrians)
+                input_traj, target_traj = input_traj.to(device), target_traj.to(device)
+                
+                metrics = safe_eval_step(model, input_traj, target_traj)
+                val_ades.append(metrics['ade'])
+                val_fdes.append(metrics['fde'])
+        else:
+             logger.warning(" [検証] 検証バッチが0のため、このエポックの検証はスキップします。")
+
+
+        avg_val_ade = np.mean(val_ades) if val_ades else float('inf')
+        avg_val_fde = np.mean(val_fdes) if val_fdes else float('inf')
+        logger.info(f" [検証] ADE: {avg_val_ade:.4f}, FDE: {avg_val_fde:.4f}")
+        
+        if avg_val_ade != float('inf'):
+            scheduler.step(avg_val_ade)
+            if avg_val_ade < best_val_ade:
+                best_val_ade = avg_val_ade
+                torch.save(model.state_dict(), os.path.join(save_directory, 'best_model_social.pth'))
+                logger.info(f"🎉 新しいベストモデルを保存しました！ (ADE: {best_val_ade:.4f})")
+
+    logger.info("🎉 訓練完了")
+
+if __name__ == "__main__":
+    main()
         
         # --- FIX: 検証データセットの有無で処理を分岐 ---
         has_validation_data = dataloader.valid_num_batches > 0
