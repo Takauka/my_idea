@@ -128,8 +128,6 @@ def safe_train_step(model, optimizer, input_traj, target_traj):
 def main():
     """メイン関数"""
     parser = argparse.ArgumentParser()
-    # --- MODIFIED: 検証関連の引数を削除 ---
-    parser.add_argument('--data_dir', type=str, default='./data/train', help='訓練データセットが格納されているディレクトリ')
     
     # モデルのハイパーパラメータ
     parser.add_argument('--hidden_dim', type=int, default=64, help='RNN/GNNの隠れ層の次元')
@@ -141,15 +139,12 @@ def main():
     parser.add_argument('--pred_len', type=int, default=12, help='予測長')
     # 訓練関連
     parser.add_argument('--batch_size', type=int, default=16, help='ミニバッチサイズ')
-    # --- FIX: --num_epochs 引数を削除 ---
+    parser.add_argument('--num_epochs', type=int, default=500, help='エポック数')
     parser.add_argument('--learning_rate', type=float, default=0.001, help='学習率')
     parser.add_argument('--weight_decay', type=float, default=1e-4, help='重み減衰')
     # その他
     parser.add_argument('--use_cuda', action="store_true", default=True, help='GPUを使用するか')
     args = parser.parse_args()
-    
-    # --- FIX: エポック数を500に直接設定 ---
-    num_epochs = 500
     
     logger.info("🚀 新しい二段階モデルの訓練を開始します (訓練特化モード)")
     device = torch.device("cuda" if args.use_cuda and torch.cuda.is_available() else "cpu")
@@ -158,9 +153,9 @@ def main():
     # --- 1. データローダーの準備 ---
     try:
         seq_len = args.obs_len + args.pred_len
-        # --- FIX: DataLoaderの呼び出しを修正。validation_size=0で全データを訓練に使用 ---
-        dataloader = DataLoader(args.data_dir, args.batch_size, seq_len, 
-                                validation_size=0,
+        # --- FIX: DataLoaderの呼び出しを、お使いのutils.pyの仕様に合わせる ---
+        dataloader = DataLoader(f_prefix='.', batch_size=args.batch_size, seq_length=seq_len, 
+                                num_of_validation=0,
                                 forcePreProcess=True)
     except FileNotFoundError as e:
         logger.error(e)
@@ -184,8 +179,8 @@ def main():
     # --- 3. 訓練ループ ---
     logger.info("🎓 訓練開始")
     
-    for epoch in range(num_epochs):
-        logger.info(f"--- Epoch {epoch+1}/{num_epochs} ---")
+    for epoch in range(args.num_epochs):
+        logger.info(f"--- Epoch {epoch+1}/{args.num_epochs} ---")
         
         # --- 訓練 ---
         model.train()
@@ -208,10 +203,8 @@ def main():
 
         logger.info(f" [訓練] Loss: {avg_loss:.4f}, ADE: {avg_ade:.4f}, FDE: {avg_fde:.4f}")
 
-        # --- MODIFIED: 検証ループを削除し、訓練ロスでスケジューラを更新 ---
         scheduler.step(avg_loss)
 
-    # --- MODIFIED: 最終エポックのモデルを保存 ---
     final_model_path = os.path.join(save_directory, 'trained_model.pth')
     torch.save(model.state_dict(), final_model_path)
     logger.info(f"🎉 訓練完了。最終モデルを '{final_model_path}' に保存しました。")
