@@ -14,6 +14,7 @@ import os
 import time
 import pickle
 import argparse
+import math
 
 # -----------------------------------------------------------------------------
 # 必要なモジュールをインポート
@@ -183,9 +184,12 @@ def main():
     parser.add_argument('--pred_len', type=int, default=12, help='予測長')
     # 訓練関連
     parser.add_argument('--batch_size', type=int, default=16, help='ミニバッチサイズ')
-    parser.add_argument('--num_epochs', type=int, default=100, help='エポック数')
+    # --- FIX: エポック数を500に変更 ---
+    parser.add_argument('--num_epochs', type=int, default=500, help='エポック数')
     parser.add_argument('--learning_rate', type=float, default=0.001, help='学習率')
     parser.add_argument('--weight_decay', type=float, default=1e-4, help='重み減衰')
+    # --- NEW: 検証データセットの割合を指定する引数を追加 ---
+    parser.add_argument('--validation_size', type=float, default=0.2, help='全データセットに対する検証データセットの割合')
     # その他
     parser.add_argument('--use_cuda', action="store_true", default=True, help='GPUを使用するか')
     args = parser.parse_args()
@@ -195,7 +199,6 @@ def main():
     logger.info(f"使用デバイス: {device}")
     
     # --- 1. データローダーの準備 ---
-    # --- FIX: ダミーデータ作成を回避するため、事前にデータ存在をチェック ---
     train_data_dir = './data/train'
     if not os.path.exists(train_data_dir) or not os.listdir(train_data_dir):
         logger.error(f"❌ 訓練データが見つかりません。'{train_data_dir}' ディレクトリにデータファイルを配置してください。")
@@ -206,8 +209,21 @@ def main():
     if not os.path.exists(save_directory): os.makedirs(save_directory)
 
     seq_len = args.obs_len + args.pred_len
-    # --- FIX: DataLoaderを1つに統合 ---
-    dataloader = DataLoader('.', args.batch_size, seq_len, num_of_validation=1, forcePreProcess=True)
+    
+    # --- NEW: データセットの総数を数え、検証セットの数を計算 ---
+    # forcePreProcess=Falseで一時的にロードし、データセット数を取得
+    temp_loader = DataLoader('.', 1, seq_len, 0, forcePreProcess=False)
+    num_total_datasets = temp_loader.num_datasets
+    num_validation_datasets = math.ceil(num_total_datasets * args.validation_size)
+    
+    if num_total_datasets == 0:
+        logger.error("❌ データセットファイルが1つも見つかりませんでした。")
+        return
+    
+    logger.info(f"📊 全{num_total_datasets}データセットのうち、{num_validation_datasets}個を検証用に使用します。")
+
+    # 計算した検証セット数で本番のDataLoaderを初期化
+    dataloader = DataLoader('.', args.batch_size, seq_len, num_of_validation=num_validation_datasets, forcePreProcess=True)
     
     # --- 2. モデル、最適化手法、スケジューラの定義 ---
     model = TwoStageTrajectoryPredictor(
