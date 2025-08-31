@@ -1,267 +1,241 @@
 """
-train_idea1.py (最終改善版)
-学習プラトーを解消するため、賢い学習率スケジューラ(ReduceLROnPlateau)を導入。
-モデルの表現力も向上させています。
+train_idea1.py (改善版)
+学習プラトーを解消するため、学習率スケジューラ(ReduceLROnPlateau)を導入。
+訓練ループを構造化し、ロギングを改善しています。
 """
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.optim as optim
+from torch.autograd import Variable
 import numpy as np
 import logging
 import os
 import time
-from typing import Dict, Any, Tuple, Optional
+import pickle
+import argparse
+import subprocess
 
+# -----------------------------------------------------------------------------
+# 必要なヘルパー関数とユーティリティをインポート
+# -----------------------------------------------------------------------------
+try:
+    from model import SocialModel
+    from utils import DataLoader
+    from grid import getSequenceGridMask
+    from helper import *
+except ImportError as e:
+    print(f"❌ 必要なモジュールが見つかりません: {e}")
+    print("👉 model.py, utils.py, helper.py, grid.py が同じ階層にあるか確認してください。")
+    exit()
+
+
+# -----------------------------------------------------------------------------
 # ログ設定
+# -----------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-def create_dummy_data(batch_size=32, seq_len=8, pred_len=12, num_pedestrians=5, feature_dim=3):
-    """3次元のダミーデータを作成"""
-    input_trajectories = torch.randn(batch_size, seq_len, num_pedestrians, feature_dim)
-    target_trajectories = torch.randn(batch_size, pred_len, num_pedestrians, feature_dim)
-    obstacle_maps = torch.randn(batch_size, 2)
-    return input_trajectories, target_trajectories, obstacle_maps
+# -----------------------------------------------------------------------------
+# 安全な訓練・評価ステップ
+# -----------------------------------------------------------------------------
 
-def check_dataloader_availability(pred_len):
-    """DataLoaderが使用可能かチェック"""
-    try:
-        if not os.path.exists('utils.py'): return False
-        from utils import DataLoader
-        data_dirs = ['data/train', 'data/test', 'data/validation']
-        if not any(os.path.exists(d) and os.listdir(d) for d in data_dirs): return False
-        loader = DataLoader(f_prefix='.', batch_size=2, seq_length=8, pred_len=pred_len)
-        return True
-    except Exception:
-        return False
-
-def process_dataloader_batch(dataloader, pred_len):
-    """DataLoaderからバッチを安全に取得し、形状を検証"""
-    try:
-        x_batch, y_batch, _, _, _, _ = dataloader.next_batch()
-        if not isinstance(x_batch, (list, np.ndarray)) or len(x_batch) == 0: return None
-
-        input_trajectories = torch.from_numpy(np.array(x_batch)).float().permute(1, 0, 2, 3)
-        target_trajectories = torch.from_numpy(np.array(y_batch)).float().permute(1, 0, 2, 3)
-        
-        if target_trajectories.shape[1] != pred_len:
-            return None
-            
-        obstacle_maps = torch.randn(input_trajectories.shape[0], 2)
-        
-        return {
-            'input_trajectories': input_trajectories,
-            'target_trajectories': target_trajectories,
-            'obstacle_map': obstacle_maps
-        }
-    except Exception:
-        return None
-
-def safe_train_step(model, optimizer, input_traj, target_traj, obstacle_map, 
-                    grad_clip_value=1.0):
+def safe_train_step(net, optimizer, x_seq, grid_seq, peds_list_seq, num_peds_list_seq, dataloader, lookup_seq):
     """安全な訓練ステップ"""
-    model.train()
+    net.train()
     optimizer.zero_grad()
     
     try:
-        final_pred, stage1_pred, _ = model(input_traj, obstacle_map)
-        target_traj_for_loss = target_traj[:, :, 0, :]
+        # Forward prop
+        outputs, _, _ = net(x_seq, grid_seq, peds_list_seq, num_peds_list_seq, dataloader, lookup_seq)
         
-        main_loss = F.mse_loss(final_pred, target_traj_for_loss)
-        stage1_loss = F.mse_loss(stage1_pred, target_traj_for_loss[:, :stage1_pred.shape[1], :])
+        # Compute loss
+        loss = Gaussian2DLikelihood(outputs, x_seq, peds_list_seq, lookup_seq)
         
-        total_loss = main_loss + 0.3 * stage1_loss
-        
-        if torch.isnan(total_loss):
-            return create_zero_losses()
+        if torch.isnan(loss):
+            logger.warning("訓練中に損失がNaNになりました。このバッチをスキップします。")
+            return {'total_loss': 0.0}
 
-        total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_value)
+        # Compute gradients
+        loss.backward()
+        
+        # Clip gradients
+        torch.nn.utils.clip_grad_norm_(net.parameters(), 10.0)
+
+        # Update parameters
         optimizer.step()
         
-        with torch.no_grad():
-            displacement_errors = torch.norm(final_pred[..., :2] - target_traj_for_loss[..., :2], dim=-1)
-            ade = displacement_errors.mean()
-            fde = torch.norm(final_pred[:, -1, :2] - target_traj_for_loss[:, -1, :2], dim=-1).mean()
-        
-        return {'total_loss': total_loss.item(), 'ade': ade.item(), 'fde': fde.item()}
+        return {'total_loss': loss.item()}
+    
     except Exception as e:
         logger.error(f"❌ 訓練ステップでエラー: {e}", exc_info=True)
-        return create_zero_losses()
+        return {'total_loss': 0.0}
 
-def safe_eval_step(model, input_traj, target_traj, obstacle_map):
+def safe_eval_step(net, x_seq, grid_seq, peds_list_seq, num_peds_list_seq, dataloader, lookup_seq, args):
     """安全な検証ステップ（勾配計算なし）"""
-    model.eval()
+    net.eval()
     with torch.no_grad():
         try:
-            final_pred, stage1_pred, _ = model(input_traj, obstacle_map)
-            target_traj_for_loss = target_traj[:, :, 0, :]
+            # Forward prop
+            outputs, _, _ = net(x_seq[:-1], grid_seq[:-1], peds_list_seq[:-1], num_peds_list_seq, dataloader, lookup_seq)
             
-            main_loss = F.mse_loss(final_pred, target_traj_for_loss)
-            stage1_loss = F.mse_loss(stage1_pred, target_traj_for_loss[:, :stage1_pred.shape[1], :])
-            total_loss = main_loss + 0.3 * stage1_loss
-            
-            displacement_errors = torch.norm(final_pred[..., :2] - target_traj_for_loss[..., :2], dim=-1)
-            ade = displacement_errors.mean()
-            fde = torch.norm(final_pred[:, -1, :2] - target_traj_for_loss[:, -1, :2], dim=-1).mean()
-            
-            return {'total_loss': total_loss.item(), 'ade': ade.item(), 'fde': fde.item()}
+            # Compute loss
+            loss = Gaussian2DLikelihood(outputs, x_seq[1:], peds_list_seq[1:], lookup_seq)
+
+            # Sample from the bivariate Gaussian
+            mux, muy, sx, sy, corr = getCoef(outputs)
+            next_x, next_y = sample_gaussian_2d(mux.data, muy.data, sx.data, sy.data, corr.data, peds_list_seq[-1], lookup_seq)
+
+            next_vals = torch.zeros_like(x_seq[-1])
+            next_vals[:, 0] = next_x
+            next_vals[:, 1] = next_y
+
+            # ADEとFDEを計算
+            ade = get_mean_error(next_vals.unsqueeze(0), x_seq[-1].data.unsqueeze(0), [peds_list_seq[-1]], [peds_list_seq[-1]], args.use_cuda, lookup_seq)
+            fde = get_final_error(next_vals.unsqueeze(0), x_seq[-1].data.unsqueeze(0), [peds_list_seq[-1]], [peds_list_seq[-1]], lookup_seq)
+
+            return {'total_loss': loss.item(), 'ade': ade, 'fde': fde}
+        
         except Exception as e:
             logger.error(f"❌ 検証ステップでエラー: {e}", exc_info=True)
-            return create_zero_losses()
+            return {'total_loss': float('inf'), 'ade': float('inf'), 'fde': float('inf')}
 
-def create_zero_losses():
-    return {'total_loss': 0.0, 'ade': 0.0, 'fde': 0.0}
-
+# -----------------------------------------------------------------------------
+# メイン処理
+# -----------------------------------------------------------------------------
 def main():
     """メイン関数"""
-    logger.info("🚀 新モデル(ECAM+SocialSTGCNN)の訓練を開始します (最終改善版)")
-    
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    logger.info(f"使用デバイス: {device}")
-    
-    torch.manual_seed(42)
-    np.random.seed(42)
-    
-    try:
-        from model import TwoStageTrajectoryPredictor
-    except ImportError:
-        logger.error("❌ model.py が見つかりません。")
-        return
-    
-    config = {
-        'batch_size': 32, 
-        'seq_len': 8, 
-        'pred_len': 12, 
-        'num_pedestrians': 5,
-        'hidden_dim': 128, # ### ★★★★★ 修正点 ★★★★★ ### モデルの表現力を向上
-        'num_epochs': 500, 
-        'learning_rate': 0.0005,
-        'weight_decay': 1e-5, 
-        'feature_dim': 3
-    }
-    logger.info(f"設定: {config}")
-    
-    use_dataloader = check_dataloader_availability(config['pred_len'])
-    train_dataloader = None
-    if use_dataloader:
-        try:
-            from utils import DataLoader
-            train_dataloader = DataLoader(
-                f_prefix='.', 
-                batch_size=config['batch_size'], 
-                seq_length=config['seq_len'],
-                pred_len=config['pred_len'] 
-            )
-            logger.info("✅ DataLoader を使用します")
-        except Exception as e:
-            logger.error(f"❌ DataLoader 作成失敗: {e}")
-            use_dataloader = False
+    parser = argparse.ArgumentParser()
+    # 基本的な設定
+    parser.add_argument('--rnn_size', type=int, default=128, help='size of RNN hidden state')
+    parser.add_argument('--embedding_size', type=int, default=64, help='Embedding dimension')
+    parser.add_argument('--batch_size', type=int, default=8, help='minibatch size')
+    parser.add_argument('--seq_length', type=int, default=20, help='RNN sequence length')
+    parser.add_argument('--pred_length', type=int, default=12, help='prediction length')
+    parser.add_argument('--num_epochs', type=int, default=50, help='number of epochs')
+    parser.add_argument('--learning_rate', type=float, default=0.003, help='learning rate')
+    parser.add_argument('--grad_clip', type=float, default=10., help='clip gradients at this value')
+    parser.add_argument('--lambda_param', type=float, default=0.0005, help='L2 regularization parameter')
+    # モデルとデータに関する設定
+    parser.add_argument('--gru', action="store_true", default=False, help='True : GRU cell, False: LSTM cell')
+    parser.add_argument('--neighborhood_size', type=int, default=32, help='Neighborhood size')
+    parser.add_argument('--grid_size', type=int, default=4, help='Grid size')
+    # 実行環境に関する設定
+    parser.add_argument('--use_cuda', action="store_true", default=True, help='Use GPU or not')
+    parser.add_argument('--drive', action="store_true", default=False, help='Use Google drive or not')
 
-    if not use_dataloader:
-        logger.info("📊 ダミーデータを使用します")
+    args = parser.parse_args()
     
-    model = TwoStageTrajectoryPredictor(
-        input_dim=config['feature_dim'], hidden_dim=config['hidden_dim'],
-        output_dim=config['feature_dim'], seq_len=config['seq_len'],
-        pred_len=config['pred_len'], num_pedestrians=config['num_pedestrians']
-    ).to(device)
+    logger.info("🚀 Social-LSTM/GRU モデルの訓練を開始します (改善版)")
+    device = torch.device("cuda" if args.use_cuda and torch.cuda.is_available() else "cpu")
+    logger.info(f"使用デバイス: {device}")
+
+    # --- 1. ディレクトリとデータローダーの準備 ---
+    f_prefix = '.'
+    if args.drive:
+        f_prefix = 'drive/semester_project/social_lstm_final' # 必要に応じて変更
     
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config['learning_rate'], weight_decay=config['weight_decay'])
+    model_name = "GRU" if args.gru else "LSTM"
+    method_name = "SOCIALLSTM"
     
-    # ### ★★★★★ 修正点 ★★★★★ ###
-    # スコアが停滞したら学習率を下げる、より賢いスケジューラに変更
-    # patience=5: 5エポック改善が見られなければ学習率を下げる
+    # モデル保存用ディレクトリを作成
+    save_directory = os.path.join(f_prefix, 'model', method_name, model_name)
+    if not os.path.exists(save_directory):
+        os.makedirs(save_directory)
+
+    # 設定ファイルを保存
+    with open(os.path.join(save_directory,'config.pkl'), 'wb') as f:
+        pickle.dump(args, f)
+
+    # データローダーの初期化
+    try:
+        dataloader = DataLoader(f_prefix, args.batch_size, args.seq_length, num_of_validation=2, forcePreProcess=True)
+        logger.info("✅ DataLoader を使用します")
+    except Exception as e:
+        logger.error(f"❌ DataLoader 作成失敗: {e}", exc_info=True)
+        return
+
+    # --- 2. モデル、最適化手法、スケジューラの定義 ---
+    net = SocialModel(args).to(device)
+    optimizer = torch.optim.Adam(net.parameters(), lr=args.learning_rate, weight_decay=args.lambda_param)
+    
+    # 検証スコアが停滞したら学習率を下げるスケジューラ
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
-    
+
+    # --- 3. 訓練ループ ---
     logger.info("🎓 訓練開始")
-    
-    best_val_ade = float('inf')
+    best_val_metric = float('inf')
     best_epoch = 0
-    
-    for epoch in range(config['num_epochs']):
-        logger.info(f"**************** Epoch {epoch+1}/{config['num_epochs']} ****************")
+
+    for epoch in range(args.num_epochs):
+        logger.info(f"**************** Epoch {epoch+1}/{args.num_epochs} ****************")
         
         # --- 訓練フェーズ ---
-        epoch_losses, epoch_ades, epoch_fdes = [], [], []
-        max_batches_per_epoch = 50
-        model.train()
-        for batch_idx in range(max_batches_per_epoch):
-            if use_dataloader:
-                batch_data = process_dataloader_batch(train_dataloader, config['pred_len'])
-                if batch_data is None:
-                    if train_dataloader.num_batches == 0: break
-                    train_dataloader.reset_batch_pointer()
-                    continue
-                input_traj, target_traj, obstacle_map = [v.to(device) for v in batch_data.values()]
-            else:
-                input_traj, target_traj, obstacle_map = create_dummy_data(**config)
-                input_traj, target_traj, obstacle_map = input_traj.to(device), target_traj.to(device), obstacle_map.to(device)
-
-            losses = safe_train_step(model, optimizer, input_traj, target_traj, obstacle_map)
-            epoch_losses.append(losses['total_loss'])
-            epoch_ades.append(losses['ade'])
-            epoch_fdes.append(losses['fde'])
+        dataloader.reset_batch_pointer(valid=False)
+        epoch_losses = []
         
-        avg_loss, avg_ade, avg_fde = np.mean(epoch_losses), np.mean(epoch_ades), np.mean(epoch_fdes)
-        logger.info(f"Epoch {epoch+1} [訓練] - Loss: {avg_loss:.4f}, ADE: {avg_ade:.4f}, FDE: {avg_fde:.4f}")
+        for batch in range(dataloader.num_batches):
+            x, _, _, num_peds_list, peds_list, _ = dataloader.next_batch()
+            
+            for sequence in range(dataloader.batch_size):
+                x_seq, peds_list_seq = x[sequence], peds_list[sequence]
+                x_seq, lookup_seq = dataloader.convert_proper_array(x_seq, num_peds_list[sequence], peds_list_seq)
+                
+                grid_seq = getSequenceGridMask(x_seq, dataloader.get_dataset_dimension(), peds_list_seq, args.neighborhood_size, args.grid_size, args.use_cuda)
+                x_seq, _ = vectorize_seq(x_seq, peds_list_seq, lookup_seq)
+                x_seq = x_seq.to(device)
+                
+                metrics = safe_train_step(net, optimizer, x_seq, grid_seq, peds_list, num_peds_list, dataloader, lookup_seq)
+                epoch_losses.append(metrics['total_loss'])
 
+        avg_loss = np.mean(epoch_losses) if epoch_losses else 0
+        logger.info(f"Epoch {epoch+1} [訓練] - 平均Loss: {avg_loss:.4f}")
+        
         # --- 検証フェーズ ---
-        val_epoch_ades, val_epoch_fdes = [], []
-        max_val_batches = 10
-        model.eval()
-        for _ in range(max_val_batches):
-            input_traj, target_traj, obstacle_map = create_dummy_data(**config)
-            input_traj, target_traj, obstacle_map = input_traj.to(device), target_traj.to(device), obstacle_map.to(device)
+        if dataloader.valid_num_batches > 0:
+            dataloader.reset_batch_pointer(valid=True)
+            val_epoch_losses, val_epoch_ades, val_epoch_fdes = [], [], []
             
-            metrics = safe_eval_step(model, input_traj, target_traj, obstacle_map)
-            val_epoch_ades.append(metrics['ade'])
-            val_epoch_fdes.append(metrics['fde'])
-        
-        avg_val_ade, avg_val_fde = np.mean(val_epoch_ades), np.mean(val_epoch_fdes)
-        logger.info(f"Epoch {epoch+1} [検証] - ADE: {avg_val_ade:.4f}, FDE: {avg_val_fde:.4f}")
+            for _ in range(dataloader.valid_num_batches):
+                x, _, _, num_peds_list, peds_list, _ = dataloader.next_valid_batch()
+                
+                for sequence in range(dataloader.batch_size):
+                    x_seq, peds_list_seq = x[sequence], peds_list[sequence]
+                    x_seq, lookup_seq = dataloader.convert_proper_array(x_seq, num_peds_list[sequence], peds_list_seq)
+                    
+                    grid_seq = getSequenceGridMask(x_seq, dataloader.get_dataset_dimension(), peds_list_seq, args.neighborhood_size, args.grid_size, args.use_cuda)
+                    x_seq, _ = vectorize_seq(x_seq, peds_list_seq, lookup_seq)
+                    x_seq = x_seq.to(device)
+                    
+                    metrics = safe_eval_step(net, x_seq, grid_seq, peds_list_seq, num_peds_list, dataloader, lookup_seq, args)
+                    val_epoch_losses.append(metrics['total_loss'])
+                    val_epoch_ades.append(metrics['ade'])
+                    val_epoch_fdes.append(metrics['fde'])
 
-        if avg_val_ade < best_val_ade:
-            best_val_ade = avg_val_ade
-            best_epoch = epoch + 1
-            torch.save(model.state_dict(), 'best_model_social.pth')
-            logger.info(f"🎉 新しいベストモデルを保存しました！ (ADE: {best_val_ade:.4f} at Epoch {best_epoch})")
+            avg_val_loss = np.mean(val_epoch_losses)
+            avg_val_ade = np.mean(val_epoch_ades)
+            avg_val_fde = np.mean(val_epoch_fdes)
+            current_val_metric = (avg_val_ade + avg_val_fde) / 2 # ADEとFDEの平均を評価指標とする
+            
+            logger.info(f"Epoch {epoch+1} [検証] - Loss: {avg_val_loss:.4f}, ADE: {avg_val_ade:.4f}, FDE: {avg_val_fde:.4f}")
 
-        # 検証ADEを元にスケジューラを更新
-        scheduler.step(avg_val_ade)
-        
+            if current_val_metric < best_val_metric:
+                best_val_metric = current_val_metric
+                best_epoch = epoch + 1
+                
+                # ベストモデルを保存
+                torch.save(net.state_dict(), os.path.join(save_directory, 'best_model_social.pth'))
+                logger.info(f"🎉 新しいベストモデルを保存しました！ (Metric: {best_val_metric:.4f} at Epoch {best_epoch})")
+
+            # 検証メトリックを元にスケジューラを更新
+            scheduler.step(current_val_metric)
+
     logger.info("🎉 訓練完了")
-    torch.save(model.state_dict(), 'last_model_social.pth')
-    logger.info(f"✅ 最終モデル保存完了: last_model_social.pth")
-    
-    if os.path.exists('best_model_social.pth'):
-        logger.info("\n" + "="*60)
-        logger.info("🏆 ベストモデルの最終評価 🏆")
-        logger.info(f"   (Epoch {best_epoch} で達成)")
-        
-        model.load_state_dict(torch.load('best_model_social.pth'))
-        
-        final_eval_ades, final_eval_fdes = [], []
-        max_eval_batches = 50
-        model.eval()
-        for _ in range(max_eval_batches):
-            input_traj, target_traj, obstacle_map = create_dummy_data(**config)
-            input_traj, target_traj, obstacle_map = input_traj.to(device), target_traj.to(device), obstacle_map.to(device)
-            metrics = safe_eval_step(model, input_traj, target_traj, obstacle_map)
-            final_eval_ades.append(metrics['ade'])
-            final_eval_fdes.append(metrics['fde'])
-            
-        final_ade, final_fde = np.mean(final_eval_ades), np.mean(final_eval_fdes)
-        
-        logger.info(f"   >> 最終ADE: {final_ade:.4f}")
-        logger.info(f"   >> 最終FDE: {final_fde:.4f}")
-        logger.info("="*60)
-    else:
-        logger.warning("ベストモデルファイル 'best_model_social.pth' が見つかりませんでした。")
+    logger.info(f"🏆 最良モデル: Epoch {best_epoch} (Metric: {best_val_metric:.4f})")
+    logger.info(f"✅ 最良モデルは '{os.path.join(save_directory, 'best_model_social.pth')}' に保存されました。")
 
 if __name__ == "__main__":
     main()
