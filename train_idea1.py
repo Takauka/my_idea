@@ -1,7 +1,7 @@
 """
-train_idea1.py (my_ideaモデル対応版)
+train_idea1.py (my_ideaモデル対応・修正版)
 新しい二段階予測モデル(TwoStageTrajectoryPredictor)を訓練します。
-データローダーからのバッチ処理、複合損失、学習率スケジューラに対応。
+モデルの出力形式に合わせてデータ処理と損失計算を最適化。
 """
 
 import torch
@@ -19,6 +19,7 @@ import argparse
 # 必要なモジュールをインポート
 # -----------------------------------------------------------------------------
 try:
+    # ユーザーが提供した新しいモデルをインポート
     from model import TwoStageTrajectoryPredictor
     from utils import DataLoader
 except ImportError as e:
@@ -38,55 +39,54 @@ logger = logging.getLogger(__name__)
 # -----------------------------------------------------------------------------
 # データ処理と訓練・評価ステップ
 # -----------------------------------------------------------------------------
-def process_batch(x_batch, y_batch, obs_len, pred_len, num_peds_fixed):
-    """DataLoaderからのバッチをモデルの入力形式に変換する"""
+def process_batch(x_batch, y_batch, target_ids_batch, obs_len, pred_len, num_peds_fixed):
+    """
+    DataLoaderからのバッチをモデル入力形式に変換。
+    ターゲット歩行者が必ずインデックス0に来るように並べ替える。
+    """
     batch_size = len(x_batch)
     
-    # バッチ内の全歩行者IDを収集
-    all_peds = set()
-    for seq in x_batch:
-        if seq.ndim >= 3 and seq.shape[2] > 1:
-             all_peds.update(np.unique(seq[:, :, 1])) # ped_idは2列目
-    
-    ped_to_idx = {ped_id: i for i, ped_id in enumerate(all_peds)}
-    num_peds_in_batch = len(all_peds)
-
     # モデル入力用のテンソルを初期化
     # (batch, seq, peds, feats)
-    input_tensor = torch.zeros(batch_size, obs_len, num_peds_in_batch, 2)
-    target_tensor = torch.zeros(batch_size, pred_len, num_peds_in_batch, 2)
-    
+    input_tensor = torch.zeros(batch_size, obs_len, num_peds_fixed, 2)
+    target_tensor = torch.zeros(batch_size, pred_len, num_peds_fixed, 2)
+
     for i in range(batch_size):
-        obs_traj = x_batch[i]
-        pred_traj = y_batch[i]
+        obs_traj_seq = x_batch[i]
+        pred_traj_seq = y_batch[i]
+        target_id = target_ids_batch[i]
+
+        # シーケンス内の全歩行者IDを収集
+        all_peds_in_seq = set()
+        if obs_traj_seq.ndim >= 3 and obs_traj_seq.shape[2] > 1:
+            all_peds_in_seq.update(np.unique(obs_traj_seq[:, :, 1]))
         
+        # ターゲットを先頭にした歩行者リストを作成
+        other_peds = sorted(list(all_peds_in_seq - {target_id}))
+        ordered_peds = [target_id] + other_peds
+        
+        # 固定長に切り詰め
+        ordered_peds = ordered_peds[:num_peds_fixed]
+        
+        ped_to_idx = {ped_id: idx for idx, ped_id in enumerate(ordered_peds)}
+        
+        # テンソルにデータを格納
         for t in range(obs_len):
-            for frame_data in obs_traj[t]:
-                if len(frame_data) >= 3:
-                    x, y, ped_id = frame_data[:3]
+            for frame_data in obs_traj_seq[t]:
+                if len(frame_data) >= 4:
+                    x, y, ped_id = frame_data[1:4] # frame, x, y, ped_id
                     if ped_id in ped_to_idx:
                         idx = ped_to_idx[ped_id]
                         input_tensor[i, t, idx, :] = torch.tensor([x, y])
-                    
+                        
         for t in range(pred_len):
-            for frame_data in pred_traj[t]:
-                if len(frame_data) >= 3:
-                    x, y, ped_id = frame_data[:3]
+            for frame_data in pred_traj_seq[t]:
+                if len(frame_data) >= 4:
+                    x, y, ped_id = frame_data[1:4]
                     if ped_id in ped_to_idx:
                         idx = ped_to_idx[ped_id]
                         target_tensor[i, t, idx, :] = torch.tensor([x, y])
 
-    # 固定長の歩行者数に合わせる (パディング or トランケート)
-    if num_peds_in_batch > num_peds_fixed:
-        input_tensor = input_tensor[:, :, :num_peds_fixed, :]
-        target_tensor = target_tensor[:, :, :num_peds_fixed, :]
-    elif num_peds_in_batch < num_peds_fixed:
-        pad_size = num_peds_fixed - num_peds_in_batch
-        input_pad = torch.zeros(batch_size, obs_len, pad_size, 2)
-        target_pad = torch.zeros(batch_size, pred_len, pad_size, 2)
-        input_tensor = torch.cat([input_tensor, input_pad], dim=2)
-        target_tensor = torch.cat([target_tensor, target_pad], dim=2)
-        
     return input_tensor, target_tensor
 
 
@@ -96,21 +96,27 @@ def safe_train_step(model, optimizer, input_traj, target_traj):
     optimizer.zero_grad()
     
     try:
-        final_pred, stage1_pred, _ = model(input_traj)
+        # モデルはターゲット歩行者の予測のみを返す
+        final_pred_target, stage1_pred_target, _ = model(input_traj)
+        
+        # 正解データもターゲット歩行者のもの（インデックス0）を抽出
+        target_traj_target = target_traj[:, :, 0, :]
         
         # 損失計算 (ターゲットが存在する箇所のみ)
-        mask = (target_traj.abs().sum(dim=-1) > 0)
+        # ターゲット歩行者がそのタイムステップに存在するかどうかのマスク
+        mask = (target_traj_target.abs().sum(dim=-1) > 0)
 
         if not mask.any(): return {'total_loss': 0.0, 'ade': 0.0, 'fde': 0.0}
         
-        main_loss = F.mse_loss(final_pred[mask], target_traj[mask])
+        # メイン損失
+        main_loss = F.mse_loss(final_pred_target[mask], target_traj_target[mask])
         
-        # Stage1の予測は長さが異なるので注意
-        short_pred_len = stage1_pred.shape[2]
-        stage1_target = target_traj[:, :, :short_pred_len, :]
-        stage1_mask = mask[:, :, :short_pred_len]
+        # Stage1の損失
+        short_pred_len = stage1_pred_target.shape[1]
+        stage1_target = target_traj_target[:, :short_pred_len, :]
+        stage1_mask = mask[:, :short_pred_len]
         
-        stage1_loss = F.mse_loss(stage1_pred[stage1_mask], stage1_target[stage1_mask])
+        stage1_loss = F.mse_loss(stage1_pred_target[stage1_mask], stage1_target[stage1_mask])
         
         total_loss = main_loss + 0.3 * stage1_loss
         
@@ -123,10 +129,10 @@ def safe_train_step(model, optimizer, input_traj, target_traj):
         optimizer.step()
         
         with torch.no_grad():
-            errors = torch.norm(final_pred - target_traj, dim=-1)
-            errors[~mask] = 0 # ターゲットがいない場所は誤差0
+            errors = torch.norm(final_pred_target - target_traj_target, dim=-1)
+            errors[~mask] = 0
             ade = errors.sum() / mask.sum()
-            fde = errors[:, -1, :].sum() / mask[:, -1, :].sum()
+            fde = errors[:, -1].sum() / mask[:, -1].sum()
 
         return {'total_loss': total_loss.item(), 'ade': ade.item(), 'fde': fde.item()}
     except Exception as e:
@@ -139,16 +145,17 @@ def safe_eval_step(model, input_traj, target_traj):
     model.eval()
     with torch.no_grad():
         try:
-            final_pred, _, _ = model(input_traj)
-            mask = (target_traj.abs().sum(dim=-1) > 0)
+            final_pred_target, _, _ = model(input_traj)
+            target_traj_target = target_traj[:, :, 0, :]
+            mask = (target_traj_target.abs().sum(dim=-1) > 0)
             
             if not mask.any(): return {'ade': 0.0, 'fde': 0.0}
             
-            errors = torch.norm(final_pred - target_traj, dim=-1)
+            errors = torch.norm(final_pred_target - target_traj_target, dim=-1)
             errors[~mask] = 0
             
             ade = errors.sum() / mask.sum()
-            fde = errors[:, -1, :].sum() / mask[:, -1, :].sum()
+            fde = errors[:, -1].sum() / mask[:, -1].sum()
             
             return {'ade': ade.item(), 'fde': fde.item()}
         except Exception as e:
@@ -189,11 +196,13 @@ def main():
 
     seq_len = args.obs_len + args.pred_len
     dataloader = DataLoader('.', args.batch_size, seq_len, num_of_validation=1, forcePreProcess=True)
-    val_dataloader = DataLoader('.', args.batch_size, seq_len, num_of_validation=1, forcePreProcess=True, is_train=False) # 検証用
+    val_dataloader = DataLoader('.', args.batch_size, seq_len, num_of_validation=1, forcePreProcess=True) # 検証用
     
     # --- 2. モデル、最適化手法、スケジューラの定義 ---
     model = TwoStageTrajectoryPredictor(
-        input_dim=2, output_dim=2, hidden_dim=args.hidden_dim, seq_len=args.obs_len,
+        # モデル定義は3次元(x, y, ?)だが、データは2次元(x, y)なので合わせる
+        input_dim=2, output_dim=2, 
+        hidden_dim=args.hidden_dim, seq_len=args.obs_len,
         pred_len=args.pred_len, num_layers=args.num_layers, dropout=args.dropout,
         num_pedestrians=args.num_pedestrians
     ).to(device)
@@ -213,8 +222,8 @@ def main():
         epoch_losses, epoch_ades, epoch_fdes = [], [], []
         dataloader.reset_batch_pointer()
         for _ in range(dataloader.num_batches):
-            x, y, _, _, _, _ = dataloader.next_batch()
-            input_traj, target_traj = process_batch(x, y, args.obs_len, args.pred_len, args.num_pedestrians)
+            x, y, _, _, _, target_ids = dataloader.next_batch()
+            input_traj, target_traj = process_batch(x, y, target_ids, args.obs_len, args.pred_len, args.num_pedestrians)
             input_traj, target_traj = input_traj.to(device), target_traj.to(device)
             
             metrics = safe_train_step(model, optimizer, input_traj, target_traj)
@@ -229,8 +238,8 @@ def main():
         val_ades, val_fdes = [], []
         val_dataloader.reset_batch_pointer(valid=True)
         for _ in range(val_dataloader.valid_num_batches):
-            x, y, _, _, _, _ = val_dataloader.next_valid_batch()
-            input_traj, target_traj = process_batch(x, y, args.obs_len, args.pred_len, args.num_pedestrians)
+            x, y, _, _, _, target_ids = val_dataloader.next_valid_batch()
+            input_traj, target_traj = process_batch(x, y, target_ids, args.obs_len, args.pred_len, args.num_pedestrians)
             input_traj, target_traj = input_traj.to(device), target_traj.to(device)
             
             metrics = safe_eval_step(model, input_traj, target_traj)
