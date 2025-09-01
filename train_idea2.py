@@ -129,6 +129,9 @@ def main():
     """メイン関数"""
     parser = argparse.ArgumentParser()
     
+    # --- NEW: データディレクトリを指定する引数を追加 ---
+    parser.add_argument('--data_dir', type=str, default='./data/train', help='訓練データセットが格納されているディレクトリ')
+    
     # モデルのハイパーパラメータ
     parser.add_argument('--hidden_dim', type=int, default=64, help='RNN/GNNの隠れ層の次元')
     parser.add_argument('--num_layers', type=int, default=2, help='LSTMの層数')
@@ -154,8 +157,8 @@ def main():
     try:
         seq_len = args.obs_len + args.pred_len
         # --- FIX: DataLoaderの呼び出しを、お使いのutils.pyの仕様に合わせる ---
-        dataloader = DataLoader(f_prefix='.', batch_size=args.batch_size, seq_length=seq_len, 
-                                num_of_validation=0,
+        dataloader = DataLoader(args.data_dir, batch_size=args.batch_size, seq_length=seq_len, 
+                                validation_size=0,
                                 forcePreProcess=True)
     except FileNotFoundError as e:
         logger.error(e)
