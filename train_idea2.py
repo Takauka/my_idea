@@ -37,7 +37,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # -----------------------------------------------------------------------------
-# データ処理と訓練・評価ステップ (変更なし)
+# データ処理と訓練・評価ステップ
 # -----------------------------------------------------------------------------
 def process_batch(x_batch, y_batch, target_ids_batch, obs_len, pred_len, num_peds_fixed):
     """
@@ -113,13 +113,41 @@ def safe_train_step(model, optimizer, input_traj, target_traj):
         with torch.no_grad():
             errors = torch.norm(final_pred_target - target_traj_target, dim=-1)
             errors[~mask] = 0
-            ade = (errors.sum() / mask.sum()).item()
-            fde = (errors[:, -1].sum() / mask[:, -1].sum()).item()
+            
+            # --- FIX: ゼロ除算を防止するために微小値(epsilon)を追加 ---
+            epsilon = 1e-6
+            ade = (errors.sum() / (mask.sum() + epsilon)).item()
+            fde = (errors[:, -1].sum() / (mask[:, -1].sum() + epsilon)).item()
 
         return {'total_loss': total_loss.item(), 'ade': ade, 'fde': fde}
     except Exception as e:
         logger.error(f"❌ 訓練ステップでエラー: {e}", exc_info=True)
         return {'total_loss': 0.0, 'ade': float('inf'), 'fde': float('inf')}
+
+def safe_eval_step(model, input_traj, target_traj):
+    """安全な検証ステップ"""
+    model.eval()
+    with torch.no_grad():
+        try:
+            final_pred_target, _, _ = model(input_traj)
+            target_traj_target = target_traj[:, :, 0, :]
+            mask = (target_traj_target.abs().sum(dim=-1) > 0)
+            
+            if not mask.any(): return {'ade': 0.0, 'fde': 0.0}
+            
+            errors = torch.norm(final_pred_target - target_traj_target, dim=-1)
+            errors[~mask] = 0
+            
+            # --- FIX: ゼロ除算を防止するために微小値(epsilon)を追加 ---
+            epsilon = 1e-6
+            ade = (errors.sum() / (mask.sum() + epsilon)).item()
+            fde = (errors[:, -1].sum() / (mask[:, -1].sum() + epsilon)).item()
+            
+            return {'ade': ade, 'fde': fde}
+        except Exception as e:
+            logger.error(f"❌ 検証ステップでエラー: {e}", exc_info=True)
+            return {'ade': float('inf'), 'fde': float('inf')}
+
 
 # -----------------------------------------------------------------------------
 # メイン処理
