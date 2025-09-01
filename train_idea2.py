@@ -158,7 +158,8 @@ def main():
         seq_len = args.obs_len + args.pred_len
         # --- FIX: DataLoaderの呼び出しを、お使いのutils.pyの仕様に合わせる ---
         dataloader = DataLoader(args.data_dir, batch_size=args.batch_size, seq_length=seq_len, 
-                                validation_size=0,
+                                validation_size=0, # 訓練のみなので検証セットは0%
+                                test_dataset_name=None, # テストセットは除外しない
                                 forcePreProcess=True)
     except FileNotFoundError as e:
         logger.error(e)
