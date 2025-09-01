@@ -119,7 +119,12 @@ class TrajectoryDataset(Dataset):
         loss_mask_list = []
         non_linear_ped = []
         for path in all_files:
-            data = read_file(path, delim)
+            # --- FIX: Social-STGCNNのデータはタブではなくスペース区切りの場合がある ---
+            try:
+                data = read_file(path, ' ')
+            except:
+                data = read_file(path, '\t')
+
             frames = np.unique(data[:, 0]).tolist()
             frame_data = [data[frame == data[:, 0], :] for frame in frames]
             num_sequences = int(
@@ -146,7 +151,7 @@ class TrajectoryDataset(Dataset):
                     if pad_end - pad_front != self.seq_len:
                         continue
                     
-                    # --- FIX: Coordinate order in Social-STGCNN data is (frame, ped, x, y) ---
+                    # --- FIX: Social-STGCNNのデータは(frame, ped, x, y) ---
                     curr_ped_seq_xy = np.transpose(curr_ped_seq[:, 2:])
                     
                     # Make coordinates relative
@@ -170,6 +175,9 @@ class TrajectoryDataset(Dataset):
                     seq_list_rel.append(curr_seq_rel[:num_peds_considered])
 
         self.num_seq = len(seq_list)
+        if self.num_seq == 0:
+            return
+
         seq_list = np.concatenate(seq_list, axis=0)
         seq_list_rel = np.concatenate(seq_list_rel, axis=0)
         loss_mask_list = np.concatenate(loss_mask_list, axis=0)
@@ -180,49 +188,21 @@ class TrajectoryDataset(Dataset):
             seq_list[:, :, :self.obs_len]).type(torch.float)
         self.pred_traj = torch.from_numpy(
             seq_list[:, :, self.obs_len:]).type(torch.float)
-        self.obs_traj_rel = torch.from_numpy(
-            seq_list_rel[:, :, :self.obs_len]).type(torch.float)
-        self.pred_traj_rel = torch.from_numpy(
-            seq_list_rel[:, :, self.obs_len:]).type(torch.float)
-        self.loss_mask = torch.from_numpy(loss_mask_list).type(torch.float)
-        self.non_linear_ped = torch.from_numpy(non_linear_ped).type(torch.float)
+        
         cum_start_idx = [0] + np.cumsum(num_peds_in_seq).tolist()
         self.seq_start_end = [
             (start, end)
             for start, end in zip(cum_start_idx, cum_start_idx[1:])
         ]
-        #Convert to Graphs
-        self.v_obs = []
-        self.A_obs = []
-        self.v_pred = []
-        self.A_pred = []
-        print("Processing Data .....")
-        pbar = tqdm(total=len(self.seq_start_end))
-        for ss in range(len(self.seq_start_end)):
-            pbar.update(1)
 
-            start, end = self.seq_start_end[ss]
-
-            v_,a_ = seq_to_graph(self.obs_traj[start:end,:],self.obs_traj_rel[start:end, :],self.norm_lap_matr)
-            self.v_obs.append(v_.clone())
-            self.A_obs.append(a_.clone())
-            v_,a_=seq_to_graph(self.pred_traj[start:end,:],self.pred_traj_rel[start:end, :],self.norm_lap_matr)
-            self.v_pred.append(v_.clone())
-            self.A_pred.append(a_.clone())
-        pbar.close()
 
     def __len__(self):
         return self.num_seq
 
     def __getitem__(self, index):
         start, end = self.seq_start_end[index]
-
+        # --- SIMPLIFIED: あなたのモデルに必要なデータのみを返す ---
         out = [
-            self.obs_traj[start:end, :], self.pred_traj[start:end, :],
-            self.obs_traj_rel[start:end, :], self.pred_traj_rel[start:end, :],
-            self.non_linear_ped[start:end], self.loss_mask[start:end, :],
-            self.v_obs[index], self.A_obs[index],
-            self.v_pred[index], self.A_pred[index]
-
+            self.obs_traj[start:end, :], self.pred_traj[start:end, :]
         ]
         return out
