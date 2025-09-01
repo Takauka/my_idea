@@ -36,6 +36,7 @@ class DataLoader():
         self.seq_length = seq_length
         self.infer = infer
 
+        # --- MODIFIED: 指定されたdata_dirから全ファイルを取得 ---
         all_files = self.get_dataset_path(self.data_dir)
         if not all_files:
             logger.error(f"❌ データが見つかりません。'{self.data_dir}'にデータを配置してください。")
@@ -99,8 +100,9 @@ class DataLoader():
         for dataset_index, directory in enumerate(data_dirs):
             logger.info(f"📂 処理中: {directory}")
             try:
+                # --- FIX: 区切り文字をタブとスペースの両方に対応 ---
                 df = pd.read_csv(directory, dtype={'frame_num': 'int', 'ped_id': 'int'},
-                                 delimiter='\t', header=None, names=['frame_num', 'ped_id', 'x', 'y'])
+                                 delimiter=r'\s+', header=None, names=['frame_num', 'ped_id', 'x', 'y'])
                 if df.empty: continue
             except Exception as e:
                 logger.error(f"❌ データ読み込みエラー {directory}: {e}")
@@ -135,6 +137,7 @@ class DataLoader():
         with open(data_file, 'rb') as f:
             raw_data = pickle.load(f)
         
+        # --- FIX: is_validation=True の場合のアンパッキングを修正 ---
         if is_validation:
             self.valid_data, self.valid_frameList, self.valid_numPedsList, self.valid_pedsList, self.valid_target_ids, self.valid_orig_data = raw_data
             counter = sum(max(0, len(frame_list) - self.seq_length) for frame_list in self.valid_data if frame_list)
@@ -153,15 +156,14 @@ class DataLoader():
         
         data_source = self.valid_data if valid else self.data
         peds_list_source = self.valid_pedsList if valid else self.pedsList
-        num_peds_source = self.valid_numPedsList if valid else self.numPedsList
         
         current_dataset_pointer = self.valid_dataset_pointer if valid else self.dataset_pointer
         current_frame_pointer = self.valid_frame_pointer if valid else self.frame_pointer
 
         while len(x_batch) < self.batch_size:
-            if current_dataset_pointer >= len(data_source): break 
+            if not data_source or current_dataset_pointer >= len(data_source): break 
             
-            if current_frame_pointer + self.seq_length >= len(data_source[current_dataset_pointer]):
+            if current_frame_pointer + self.seq_length + 1 > len(data_source[current_dataset_pointer]):
                 current_dataset_pointer, current_frame_pointer = self._tick_batch_pointer(valid, current_dataset_pointer)
                 if current_dataset_pointer == 0 and current_frame_pointer == 0: break 
                 continue
@@ -169,7 +171,6 @@ class DataLoader():
             x_seq = data_source[current_dataset_pointer][current_frame_pointer : current_frame_pointer + self.seq_length]
             y_seq = data_source[current_dataset_pointer][current_frame_pointer + 1 : current_frame_pointer + self.seq_length + 1]
             peds_list_seq = peds_list_source[current_dataset_pointer][current_frame_pointer : current_frame_pointer + self.seq_length]
-            num_peds_seq = num_peds_source[current_dataset_pointer][current_frame_pointer : current_frame_pointer + self.seq_length]
             
             possible_targets = peds_list_seq[0]
             if not possible_targets:
@@ -178,7 +179,7 @@ class DataLoader():
 
             target_id = random.choice(possible_targets)
             x_batch.append(x_seq); y_batch.append(y_seq); d_batch.append(current_dataset_pointer)
-            numPedsList_batch.append(num_peds_seq); PedsList_batch.append(peds_list_seq); target_ids_batch.append(target_id)
+            PedsList_batch.append(peds_list_seq); target_ids_batch.append(target_id)
             
             current_frame_pointer += 1
 
@@ -187,14 +188,13 @@ class DataLoader():
         else:
             self.dataset_pointer, self.frame_pointer = current_dataset_pointer, current_frame_pointer
 
-        return x_batch, y_batch, d_batch, numPedsList_batch, PedsList_batch, target_ids_batch
+        return x_batch, y_batch, d_batch, None, PedsList_batch, target_ids_batch
 
     def _tick_batch_pointer(self, valid, current_pointer):
         current_pointer += 1
-        if valid:
-            if current_pointer >= len(self.valid_data): current_pointer = 0
-        else:
-            if current_pointer >= len(self.data): current_pointer = 0
+        data_len = len(self.valid_data) if valid else len(self.data)
+        if current_pointer >= data_len:
+            current_pointer = 0
         return current_pointer, 0
             
     def reset_batch_pointer(self, valid=False):
