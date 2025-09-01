@@ -1,5 +1,5 @@
 """
-train_idea2.py (my_ideaモデル対応・訓練特化版)
+train_idea2.py (my_ideaモデル対応・最終版)
 新しい二段階予測モデル(TwoStageTrajectoryPredictor)を訓練します。
 このスクリプトは検証を行わず、訓練のみに専念します。
 """
@@ -14,7 +14,6 @@ import os
 import time
 import pickle
 import argparse
-import math
 
 # -----------------------------------------------------------------------------
 # 必要なモジュールをインポート
@@ -153,9 +152,10 @@ def main():
     # --- 1. データローダーの準備 ---
     try:
         seq_len = args.obs_len + args.pred_len
-        # --- FIX: DataLoaderの呼び出しを、お使いのutils.pyの仕様に合わせる ---
-        dataloader = DataLoader(f_prefix='.', batch_size=args.batch_size, seq_length=seq_len, 
+        # --- FIX: DataLoaderの呼び出しを、最新のutils.pyの仕様に合わせる ---
+        dataloader = DataLoader(data_dir='./data/train', batch_size=args.batch_size, seq_length=seq_len, 
                                 validation_size=0, # 訓練のみなので検証セットは0%
+                                test_dataset_name=None, # テストセットは除外しない
                                 forcePreProcess=True)
     except FileNotFoundError as e:
         logger.error(e)
