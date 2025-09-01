@@ -17,7 +17,6 @@ from tqdm import tqdm
 # 必要なモジュールをインポート
 # -----------------------------------------------------------------------------
 try:
-    # --- FIX: あなたのモデルを正しくインポート ---
     from model import TwoStageTrajectoryPredictor
     from utils import TrajectoryDataset
     from torch.utils.data import DataLoader, ConcatDataset
@@ -70,7 +69,9 @@ def safe_train_step(model, optimizer, input_traj, target_traj):
     try:
         final_pred, stage1_pred, _ = model(input_traj)
         
-        # GTもターゲット歩行者(index 0)の軌跡を抽出
+        # --- FIX: モデルの出力(batch=1)とGTの次元を合わせる ---
+        final_pred = final_pred.squeeze(0)
+        stage1_pred = stage1_pred.squeeze(0)
         target_gt = target_traj.squeeze(0)[:, 0, :]
         
         mask = (target_gt.abs().sum(dim=-1) > 0)
@@ -78,7 +79,7 @@ def safe_train_step(model, optimizer, input_traj, target_traj):
         
         loss_final = nn.functional.mse_loss(final_pred[mask], target_gt[mask])
         
-        short_pred_len = stage1_pred.shape[1]
+        short_pred_len = stage1_pred.shape[0]
         stage1_target = target_gt[:short_pred_len, :]
         stage1_mask = mask[:short_pred_len]
 
@@ -151,7 +152,6 @@ def main():
         logger.error(f"❌ {e}")
         return
 
-    # --- FIX: あなたのモデルを正しく呼び出す ---
     model = TwoStageTrajectoryPredictor(
         input_dim=2, output_dim=2,
         seq_len=args.obs_len, pred_len=args.pred_len,
@@ -171,20 +171,18 @@ def main():
             obs_traj, pred_traj_gt = batch
             obs_traj, pred_traj_gt = obs_traj.to(device), pred_traj_gt.to(device)
             
-            # squeeze(0) は DataLoader の batch_size=1 のため
             obs_traj = obs_traj.squeeze(0)
             pred_traj_gt = pred_traj_gt.squeeze(0)
             
-            # --- NEW: 通訳関数を呼び出す ---
             input_traj, target_traj = transform_batch_for_model(obs_traj, pred_traj_gt, args.num_pedestrians)
             
-            loss, ade, fde = safe_train_step(model, optimizer, input_traj, target_traj)
+            # --- FIX: metrics辞書を正しく受け取る ---
+            metrics = safe_train_step(model, optimizer, input_traj, target_traj)
             
-            if loss is not None:
-                epoch_loss += loss
-                epoch_ade += ade
-                epoch_fde += fde
-                pbar.set_postfix(loss=f'{loss:.4f}', ade=f'{ade:.4f}', fde=f'{fde:.4f}')
+            epoch_loss += metrics['total_loss']
+            epoch_ade += metrics['ade']
+            epoch_fde += metrics['fde']
+            pbar.set_postfix(loss=f"{metrics['total_loss']:.4f}", ade=f"{metrics['ade']:.4f}", fde=f"{metrics['fde']:.4f}")
         
         scheduler.step()
         
@@ -200,6 +198,10 @@ def main():
     final_model_path = os.path.join(save_directory, 'trained_model.pth')
     torch.save(model.state_dict(), final_model_path)
     logger.info(f"🎉 訓練完了。最終モデルを '{final_model_path}' に保存しました。")
+
+
+if __name__ == '__main__':
+    main()
 
 
 if __name__ == '__main__':
