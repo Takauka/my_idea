@@ -145,17 +145,20 @@ class TrajectoryDataset(Dataset):
                     pad_end = frames.index(curr_ped_seq[-1, 0]) - idx + 1
                     if pad_end - pad_front != self.seq_len:
                         continue
-                    curr_ped_seq = np.transpose(curr_ped_seq[:, 2:])
+                    
+                    # --- FIX: Coordinate order in Social-STGCNN data is (frame, ped, x, y) ---
+                    curr_ped_seq_xy = np.transpose(curr_ped_seq[:, 2:])
+                    
                     # Make coordinates relative
-                    rel_curr_ped_seq = np.zeros(curr_ped_seq.shape)
+                    rel_curr_ped_seq = np.zeros(curr_ped_seq_xy.shape)
                     rel_curr_ped_seq[:, 1:] = \
-                        curr_ped_seq[:, 1:] - curr_ped_seq[:, :-1]
+                        curr_ped_seq_xy[:, 1:] - curr_ped_seq_xy[:, :-1]
                     _idx = num_peds_considered
-                    curr_seq[_idx, :, pad_front:pad_end] = curr_ped_seq
+                    curr_seq[_idx, :, pad_front:pad_end] = curr_ped_seq_xy
                     curr_seq_rel[_idx, :, pad_front:pad_end] = rel_curr_ped_seq
                     # Linear vs Non-Linear Trajectory
                     _non_linear_ped.append(
-                        poly_fit(curr_ped_seq, pred_len, threshold))
+                        poly_fit(curr_ped_seq_xy, pred_len, threshold))
                     curr_loss_mask[_idx, pad_front:pad_end] = 1
                     num_peds_considered += 1
 
